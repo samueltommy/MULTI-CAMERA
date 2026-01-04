@@ -1,0 +1,7 @@
+opencv-python
+ultralytics
+flask
+deep-sort-realtime
+aiortc
+av
+aiohttp

@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>YOLOv8 Segmentation Video Streams</title>
+    <style>
+      body {
+        display: flex;
+        justify-content: space-around;
+        align-items: center;
+        height: 100vh;
+        margin: 0;
+        background-color: #f0f0f0;
+      }
+      img {
+        max-width: 45%;
+        height: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Real-time YOLOv8 Segmentation (WebRTC)</h1>
+    <div style="display: flex; gap: 20px; align-items: flex-start">
+      <div>
+        <video
+          id="video1"
+          autoplay
+          playsinline
+          muted
+          style="width: 480px; height: auto; border: 1px solid #333"
+        ></video>
+        <div>Camera 1 (WebRTC)</div>
+      </div>
+      <div>
+        <video
+          id="video2"
+          autoplay
+          playsinline
+          muted
+          style="width: 480px; height: auto; border: 1px solid #333"
+        ></video>
+        <div>Camera 2 (WebRTC)</div>
+      </div>
+    </div>
+
+    <script>
+      async function startWebRTC(cam, videoEl) {
+        // fetch ICE config from server (supports TURN if configured)
+        let iceServers = [{ urls: "stun:stun.l.google.com:19302" }];
+        try {
+          const r = await fetch("/ice");
+          if (r.ok) {
+            const j = await r.json();
+            if (j && j.iceServers) iceServers = j.iceServers;
+          }
+        } catch (e) {
+          console.warn("Failed to fetch /ice, using default STUN", e);
+        }
+        const pc = new RTCPeerConnection({ iceServers });
+        pc.ontrack = (evt) => {
+          videoEl.srcObject = evt.streams[0];
+        };
+
+        pc.oniceconnectionstatechange = () =>
+          console.log("ICE", pc.iceConnectionState);
+
+        // indicate we want to receive video so the offer includes media m= lines
+        pc.addTransceiver("video", { direction: "recvonly" });
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        const resp = await fetch(
+          `http://${location.hostname}:8080/offer?cam=${cam}`,
+          {
+            method: "POST",
+            body: JSON.stringify({ sdp: offer.sdp, type: offer.type }),
+            headers: { "Content-Type": "application/json" },
+          }
+        );
+        const ans = await resp.json();
+        await pc.setRemoteDescription(new RTCSessionDescription(ans));
+      }
+
+      // Auto-start both streams on load, with simple retry on failure
+      window.addEventListener("DOMContentLoaded", () => {
+        const v1 = document.getElementById("video1");
+        const v2 = document.getElementById("video2");
+        const tryStart = async (cam, videoEl, attempts = 3) => {
+          for (let i = 0; i < attempts; i++) {
+            try {
+              await startWebRTC(cam, videoEl);
+              console.log("WebRTC started for cam", cam);
+              return;
+            } catch (err) {
+              console.warn("Failed to start cam", cam, err);
+              await new Promise((r) => setTimeout(r, 500 * (i + 1)));
+            }
+          }
+          console.error("Giving up starting cam", cam);
+        };
+        tryStart(1, v1);
+        tryStart(2, v2);
+      });
+    </script>
+  </body>
+</html>
