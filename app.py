@@ -1,4 +1,4 @@
-from flask import Flask, render_template
+from flask import Flask, render_template, request, jsonify, send_from_directory, url_for
 import cv2
 from ultralytics import YOLO
 import threading
@@ -20,6 +20,29 @@ import multiprocessing
 from multiprocessing import shared_memory
 import atexit
 from statistics import mean
+from src import fusion
+import math
+import base64
+import io
+import time as _time
+import logging
+from collections import deque
+
+# snapshots for fused objects
+SNAPSHOT_DIR = os.environ.get('SNAPSHOT_DIR', 'snapshots')
+os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+
+# matching parameters (configurable)
+MATCH_MAX_DIST_PX = float(os.environ.get('MATCH_MAX_DIST_PX', '80.0'))
+FUSE_TIME_WINDOW = float(os.environ.get('FUSE_TIME_WINDOW', '2.0'))  # seconds to keep track alive
+ASSOC_WEIGHT_SIDE = float(os.environ.get('ASSOC_WEIGHT_SIDE', '1.0'))
+ASSOC_WEIGHT_TOP = float(os.environ.get('ASSOC_WEIGHT_TOP', '0.6'))
+# time decay factor (seconds): older tracks are penalized by exp(-(dt)/ASSOC_TIME_DECAY)
+ASSOC_TIME_DECAY = float(os.environ.get('ASSOC_TIME_DECAY', '3.0'))
+
+# persistent fused tracks
+fused_tracks = []  # list of dicts: {'id', 'last_seen', 'top_center','side_center','snap_top','snap_side'}
+fused_id_counter = 1
 
 app = Flask(__name__)
 
@@ -29,7 +52,7 @@ print(f"Using device: {device}")
 
 # Load YOLO model
 # Configurable runtime options (environment overrides for edge tuning)
-MODEL_PATH = os.environ.get('MODEL_PATH', 'yolov8s-seg.pt')
+MODEL_PATH = os.environ.get('MODEL_PATH', 'models/yolov8s-seg.pt')
 TARGET_FPS = int(os.environ.get('TARGET_FPS', '12'))
 INFERENCE_WIDTH = int(os.environ.get('INFERENCE_WIDTH', '480'))
 ENABLE_MASKS = os.environ.get('ENABLE_MASKS', '1').lower() in ('1', 'true', 'yes')
@@ -44,6 +67,8 @@ MOTION_DETECTION_WIDTH = int(os.environ.get('MOTION_DETECTION_WIDTH', '320'))
 MOTION_THRESHOLD = float(os.environ.get('MOTION_THRESHOLD', '0.02'))  # fraction of changed pixels
 MOTION_HIGH_FPS = int(os.environ.get('MOTION_HIGH_FPS', '8'))
 MOTION_LOW_FPS = int(os.environ.get('MOTION_LOW_FPS', '1'))
+# synchronization tolerance (milliseconds)
+SYNC_TOL_MS = int(os.environ.get('SYNC_TOL_MS', '500'))
 # limit torch threads on CPU edge devices
 TORCH_THREADS = int(os.environ.get('TORCH_THREADS', '1'))
 try:
@@ -75,6 +100,20 @@ display_tick_lock = threading.Lock()
 raw_frames = [None, None]
 raw_timestamps = [0.0, 0.0]
 raw_locks = [threading.Lock(), threading.Lock()]
+# latest detection metadata (scaled to original frame coords)
+raw_detections = [None, None]
+raw_detection_ts = [0.0, 0.0]
+fused_objects = []
+
+# try to load homography matrix (top -> side) from file if provided
+HOMOGRAPHY_PATH = os.environ.get('HOMOGRAPHY_PATH', 'homography_top_to_side.npy')
+fusion_H = None
+try:
+    if os.path.exists(HOMOGRAPHY_PATH):
+        fusion_H = np.load(HOMOGRAPHY_PATH)
+        print(f"Loaded homography from {HOMOGRAPHY_PATH}")
+except Exception as e:
+    print('Homography load failed:', e)
 
 # Multiprocessing queues for worker communication (set in __main__)
 worker_in_q = None
@@ -222,6 +261,19 @@ def worker_process(in_q, out_q, model_path, device_name, use_half, enable_masks,
             except Exception:
                 boxes, scores, class_ids = [], [], []
 
+            # build detection metadata in small (worker) coordinates
+            detections = []
+            try:
+                for i, (box, score, cls) in enumerate(zip(boxes, scores, class_ids)):
+                    x1, y1, x2, y2 = [int(v) for v in box]
+                    cx = (x1 + x2) / 2.0
+                    cy = (y1 + y2) / 2.0
+                    bottom_cx = (x1 + x2) / 2.0
+                    bottom_cy = float(y2)
+                    detections.append({'box': [int(x1), int(y1), int(x2), int(y2)], 'score': float(score), 'cls': int(cls), 'center': (cx, cy), 'bottom_center': (bottom_cx, bottom_cy)})
+            except Exception:
+                detections = []
+
             # draw masks on small if enabled (use per-class color and alpha blending)
             if enable_masks and getattr(results[0], 'masks', None) is not None:
                 masks = results[0].masks.xy
@@ -270,12 +322,12 @@ def worker_process(in_q, out_q, model_path, device_name, use_half, enable_masks,
                 if h2 <= max_h and w2 <= max_w:
                     dest = _np.ndarray((max_h, max_w, 3), dtype=_np.uint8, buffer=out_buf)
                     dest[:h2, :w2, :] = annotated
-                    out_q.put({'cam': cam, 'shape': (h2, w2, 3)})
+                    out_q.put({'cam': cam, 'shape': (h2, w2, 3), 'detections': detections, 'ts': time.time()})
                 else:
                     # fallback: encode jpeg and send
                     ok, buf = _cv2.imencode('.jpg', annotated, [int(_cv2.IMWRITE_JPEG_QUALITY), 80])
                     if ok:
-                        out_q.put({'cam': cam, 'jpeg': buf.tobytes()})
+                        out_q.put({'cam': cam, 'jpeg': buf.tobytes(), 'detections': detections, 'ts': time.time()})
             except Exception:
                 out_q.put({'error': 'worker output write failed'})
         except Exception:
@@ -412,8 +464,26 @@ def inference_tick_loop(target_fps=8, inference_width=640, alpha=0.45):
                             continue
                         annotated_orig = cv2.resize(ann_small, (orig_frame.shape[1], orig_frame.shape[0]))
                         temp_outs[cam] = annotated_orig
-                        with metrics_lock:
-                            metrics['processed_frames'] += 1
+                        # scale detections (worker sent detections in small frame coords)
+                        dets = res.get('detections') or []
+                        try:
+                            ih, iw = h2, w2
+                            oh, ow = orig_frame.shape[0], orig_frame.shape[1]
+                            sx = float(ow) / float(iw) if iw > 0 else 1.0
+                            sy = float(oh) / float(ih) if ih > 0 else 1.0
+                            scaled = []
+                            for d in dets:
+                                b = d.get('box', [0,0,0,0])
+                                cx, cy = d.get('center', (None, None))
+                                bcx, bcy = d.get('bottom_center', (None, None))
+                                sb = [int(b[0]*sx), int(b[1]*sy), int(b[2]*sx), int(b[3]*sy)]
+                                sc = (float(cx)*sx if cx is not None else None, float(cy)*sy if cy is not None else None)
+                                sbc = (float(bcx)*sx if bcx is not None else None, float(bcy)*sy if bcy is not None else None)
+                                scaled.append({'box': sb, 'score': d.get('score'), 'cls': d.get('cls'), 'center': sc, 'bottom_center': sbc})
+                            raw_detections[cam] = scaled
+                        except Exception:
+                            raw_detections[cam] = None
+                        raw_detection_ts[cam] = res.get('ts', ts0 if cam == 0 else ts1)
                         with metrics_lock:
                             metrics['processed_frames'] += 1
                     except Exception as e:
@@ -432,6 +502,26 @@ def inference_tick_loop(target_fps=8, inference_width=640, alpha=0.45):
                             continue
                         annotated_orig = cv2.resize(ann_small, (orig_frame.shape[1], orig_frame.shape[0]))
                         temp_outs[cam] = annotated_orig
+                        # scale detections if provided
+                        dets = res.get('detections') or []
+                        try:
+                            ih, iw = ann_small.shape[0], ann_small.shape[1]
+                            oh, ow = orig_frame.shape[0], orig_frame.shape[1]
+                            sx = float(ow) / float(iw) if iw > 0 else 1.0
+                            sy = float(oh) / float(ih) if ih > 0 else 1.0
+                            scaled = []
+                            for d in dets:
+                                b = d.get('box', [0,0,0,0])
+                                cx, cy = d.get('center', (None, None))
+                                bcx, bcy = d.get('bottom_center', (None, None))
+                                sb = [int(b[0]*sx), int(b[1]*sy), int(b[2]*sx), int(b[3]*sy)]
+                                sc = (float(cx)*sx if cx is not None else None, float(cy)*sy if cy is not None else None)
+                                sbc = (float(bcx)*sx if bcx is not None else None, float(bcy)*sy if bcy is not None else None)
+                                scaled.append({'box': sb, 'score': d.get('score'), 'cls': d.get('cls'), 'center': sc, 'bottom_center': sbc})
+                            raw_detections[cam] = scaled
+                        except Exception:
+                            raw_detections[cam] = None
+                        raw_detection_ts[cam] = res.get('ts', ts0 if cam == 0 else ts1)
                     except Exception as e:
                         print('Error decoding worker result:', e)
 
@@ -448,6 +538,157 @@ def inference_tick_loop(target_fps=8, inference_width=640, alpha=0.45):
             display_frame_id += 1
             display_frame_ids[0] = display_frame_id
             display_frame_ids[1] = display_frame_id
+
+        # Attempt homography-based fusion if calibrated
+        try:
+            if fusion_H is not None and raw_detections[0] and raw_detections[1]:
+                t0 = raw_detection_ts[0]
+                t1 = raw_detection_ts[1]
+                if abs(t0 - t1) <= (SYNC_TOL_MS / 1000.0):
+                    matches = fusion.match_detections(raw_detections[0], raw_detections[1], fusion_H, max_dist_px=MATCH_MAX_DIST_PX)
+                    fused_objects = []
+                    now_ts = time.time()
+
+                    # prune old fused tracks
+                    try:
+                        fused_tracks[:] = [ft for ft in fused_tracks if (now_ts - ft.get('last_seen', 0.0)) <= FUSE_TIME_WINDOW]
+                    except Exception:
+                        pass
+
+                    for mi, mj, dist in matches:
+                        top = raw_detections[0][mi]
+                        side = raw_detections[1][mj]
+
+                        # compute association score to existing fused tracks using both top and side positions + time decay
+                        best_ft = None
+                        best_score = None
+                        side_bc = side.get('bottom_center')
+                        top_c = top.get('center')
+
+                        for ft in fused_tracks:
+                            prev_side = ft.get('side_center')
+                            prev_top = ft.get('top_center')
+                            if prev_side is None and prev_top is None:
+                                continue
+                            # side distance
+                            ds = 1e6
+                            if prev_side is not None and side_bc is not None:
+                                dx = prev_side[0] - side_bc[0]
+                                dy = prev_side[1] - side_bc[1]
+                                ds = (dx*dx + dy*dy) ** 0.5
+                            # top distance
+                            dt = 1e6
+                            if prev_top is not None and top_c is not None:
+                                dx2 = prev_top[0] - top_c[0]
+                                dy2 = prev_top[1] - top_c[1]
+                                dt = (dx2*dx2 + dy2*dy2) ** 0.5
+
+                            # weighted spatial score (lower is better)
+                            spatial = ASSOC_WEIGHT_SIDE * ds + ASSOC_WEIGHT_TOP * dt
+
+                            # apply time decay penalty (older tracks get penalized)
+                            last = ft.get('last_seen', now_ts)
+                            dt_age = now_ts - last
+                            time_penalty = math.exp(-(dt_age) / max(1e-6, ASSOC_TIME_DECAY))
+                            score = spatial / max(1e-6, time_penalty)
+
+                            if best_score is None or score < best_score:
+                                best_score = score
+                                best_ft = ft
+
+                        # threshold by MATCH_MAX_DIST_PX using the side distance primarily
+                        attached = None
+                        if best_ft is not None:
+                            # compute side distance to decide
+                            prev_side = best_ft.get('side_center')
+                            if prev_side is not None and side_bc is not None:
+                                dx = prev_side[0] - side_bc[0]
+                                dy = prev_side[1] - side_bc[1]
+                                side_dist = (dx*dx + dy*dy) ** 0.5
+                            else:
+                                side_dist = float('inf')
+                            if side_dist <= MATCH_MAX_DIST_PX:
+                                attached = best_ft
+
+                        if attached is None:
+                            # create new fused track
+                            global fused_id_counter
+                            fid = fused_id_counter
+                            fused_id_counter += 1
+                            attached = {'id': fid, 'first_seen': now_ts, 'last_seen': now_ts, 'top_center': top.get('center'), 'side_center': side.get('bottom_center'), 'snaps': []}
+                            fused_tracks.append(attached)
+                        else:
+                            attached['last_seen'] = now_ts
+                            attached['top_center'] = top.get('center')
+                            attached['side_center'] = side.get('bottom_center')
+
+                        # save snapshots (cropped) from both frames for visual verification
+                        try:
+                            # top crop
+                            with lock1:
+                                src_img = frames1[0].copy() if frames1[0] is not None else None
+                            with lock2:
+                                dst_img = frames2[0].copy() if frames2[0] is not None else None
+                            top_box = top.get('box')
+                            side_box = side.get('box')
+                            top_path = None
+                            side_path = None
+                            if src_img is not None and top_box:
+                                x1,y1,x2,y2 = top_box
+                                h,w = src_img.shape[:2]
+                                x1c, y1c = max(0,min(w-1,x1)), max(0,min(h-1,y1))
+                                x2c, y2c = max(0,min(w-1,x2)), max(0,min(h-1,y2))
+                                crop = src_img[y1c:y2c, x1c:x2c].copy() if y2c>y1c and x2c>x1c else None
+                                if crop is not None:
+                                    top_path = os.path.join(SNAPSHOT_DIR, f"id{attached['id']}_top_{int(now_ts)}.jpg")
+                                    cv2.imwrite(top_path, crop)
+                            if dst_img is not None and side_box:
+                                x1,y1,x2,y2 = side_box
+                                h,w = dst_img.shape[:2]
+                                x1c, y1c = max(0,min(w-1,x1)), max(0,min(h-1,y1))
+                                x2c, y2c = max(0,min(w-1,x2)), max(0,min(h-1,y2))
+                                crop = dst_img[y1c:y2c, x1c:x2c].copy() if y2c>y1c and x2c>x1c else None
+                                if crop is not None:
+                                    side_path = os.path.join(SNAPSHOT_DIR, f"id{attached['id']}_side_{int(now_ts)}.jpg")
+                                    cv2.imwrite(side_path, crop)
+
+                            if top_path or side_path:
+                                attached['snaps'].append({'ts': now_ts, 'top': os.path.basename(top_path) if top_path else None, 'side': os.path.basename(side_path) if side_path else None})
+                        except Exception:
+                            pass
+
+                        fused_objects.append({'top_idx': mi, 'side_idx': mj, 'dist': dist, 'top': top, 'side': side, 'fid': attached['id']})
+
+                    # draw simple annotations for matches on both frames
+                    with lock1:
+                        if frames1[0] is not None:
+                            for fo in fused_objects:
+                                tc = fo['top'].get('center')
+                                fid = fo.get('fid')
+                                if tc is not None and tc[0] is not None:
+                                    cv2.circle(frames1[0], (int(tc[0]), int(tc[1])), 6, (0, 255, 0), -1)
+                                    cv2.putText(frames1[0], f"ID{fid}", (int(tc[0]) + 6, int(tc[1]) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    with lock2:
+                        if frames2[0] is not None:
+                            # --- NEW DEBUG CODE ---
+                            if fusion_H is not None and raw_detections[0]:
+                                # Draw where the Top Camera "thinks" the chickens are on the Side View
+                                for d in raw_detections[0]:
+                                    c = d.get('center')
+                                    if c:
+                                        # Project Top-Center -> Side-View
+                                        proj_pt = fusion.project_point(fusion_H, c)
+                                        if proj_pt:
+                                            # Draw RED circle for projection
+                                            cv2.circle(frames2[0], (int(proj_pt[0]), int(proj_pt[1])), 8, (0, 0, 255), 2)
+                            for fo in fused_objects:
+                                sc = fo['side'].get('bottom_center')
+                                fid = fo.get('fid')
+                                if sc is not None and sc[0] is not None:
+                                    cv2.circle(frames2[0], (int(sc[0]), int(sc[1])), 6, (0, 255, 0), -1)
+                                    cv2.putText(frames2[0], f"ID{fid}", (int(sc[0]) + 6, int(sc[1]) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        except Exception:
+            pass
 
         # sleep until next tick
         elapsed = time.time() - t0
@@ -597,6 +838,51 @@ def index():
 @app.route('/webrtc')
 def webrtc_page():
     return render_template('webrtc.html')
+
+
+@app.route('/calibrate')
+def calibrate_page():
+    return render_template('calibrate.html')
+
+
+@app.route('/gallery')
+def gallery_page():
+    return render_template('gallery.html')
+
+
+@app.route('/calibrate/compute', methods=['POST'])
+def calibrate_compute():
+    global fusion_H
+    try:
+        data = request.get_json()
+        src = data.get('src')
+        dst = data.get('dst')
+        if not src or not dst or len(src) < 4 or len(dst) < 4 or len(src) != len(dst):
+            return jsonify({'error': 'need matching arrays of >=4 points: src,dst'}), 400
+        H, status = fusion.compute_homography(src, dst)
+        if H is None:
+            return jsonify({'error': 'homography compute failed'}), 500
+        np.save(HOMOGRAPHY_PATH, H)
+        fusion_H = H
+        return jsonify({'ok': True, 'saved': HOMOGRAPHY_PATH})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/fused')
+def fused_list():
+    # return fused tracks metadata
+    out = []
+    for ft in fused_tracks:
+        snaps = ft.get('snaps', [])
+        last = ft.get('last_seen', 0.0)
+        out.append({'id': ft.get('id'), 'first_seen': ft.get('first_seen'), 'last_seen': last, 'top_center': ft.get('top_center'), 'side_center': ft.get('side_center'), 'snaps': snaps})
+    return jsonify({'tracks': out})
+
+
+@app.route('/snapshots/<path:filename>')
+def snapshot_file(filename):
+    return send_from_directory(SNAPSHOT_DIR, filename)
 
 # MJPEG endpoints removed — use WebRTC via / (index) which auto-starts streams.
 

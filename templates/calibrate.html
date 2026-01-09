@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Calibration</title>
+  </head>
+  <body>
+    <h2>Compute Homography</h2>
+    <p>
+      Provide JSON arrays of source (top) and destination (side) image points.
+      Each array is a list of [x,y]. Need at least 4 pairs.
+    </p>
+    <div>
+      <label>Top points (src):</label><br />
+      <textarea id="src" rows="6" cols="60">
+[[100,100],[400,100],[400,400],[100,400]]</textarea
+      >
+    </div>
+    <div>
+      <label>Side points (dst):</label><br />
+      <textarea id="dst" rows="6" cols="60">
+[[120,200],[500,220],[480,520],[140,500]]</textarea
+      >
+    </div>
+    <button id="compute">Compute & Save</button>
+    <pre id="result"></pre>
+
+    <script>
+      document
+        .getElementById("compute")
+        .addEventListener("click", async function () {
+          const src = JSON.parse(document.getElementById("src").value);
+          const dst = JSON.parse(document.getElementById("dst").value);
+          const res = await fetch("/calibrate/compute", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ src: src, dst: dst }),
+          });
+          const j = await res.json();
+          document.getElementById("result").textContent = JSON.stringify(
+            j,
+            null,
+            2
+          );
+        });
+    </script>
+  </body>
+</html>
