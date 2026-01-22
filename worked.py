@@ -3,6 +3,7 @@ import cv2
 from ultralytics import YOLO
 import threading
 import time
+from deep_sort_realtime.deepsort_tracker import DeepSort
 import torch
 import numpy as np
 import asyncio
@@ -26,12 +27,10 @@ import io
 import time as _time
 import logging
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 
 # snapshots for fused objects
 SNAPSHOT_DIR = os.environ.get('SNAPSHOT_DIR', 'snapshots')
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
-snapshot_executor = ThreadPoolExecutor(max_workers=2)
 
 # matching parameters (configurable)
 MATCH_MAX_DIST_PX = float(os.environ.get('MATCH_MAX_DIST_PX', '80.0'))
@@ -53,7 +52,7 @@ print(f"Using device: {device}")
 
 # Load YOLO model
 # Configurable runtime options (environment overrides for edge tuning)
-MODEL_PATH = os.environ.get('MODEL_PATH', 'models/yolov8s-seg_openvino_model/')
+MODEL_PATH = os.environ.get('MODEL_PATH', 'models/yolov8s-seg.pt')
 TARGET_FPS = int(os.environ.get('TARGET_FPS', '12'))
 INFERENCE_WIDTH = int(os.environ.get('INFERENCE_WIDTH', '480'))
 ENABLE_MASKS = os.environ.get('ENABLE_MASKS', '1').lower() in ('1', 'true', 'yes')
@@ -102,7 +101,7 @@ raw_frames = [None, None]
 raw_timestamps = [0.0, 0.0]
 raw_locks = [threading.Lock(), threading.Lock()]
 # latest detection metadata (scaled to original frame coords)
-raw_detections = [[], []]
+raw_detections = [None, None]
 raw_detection_ts = [0.0, 0.0]
 fused_objects = []
 
@@ -129,11 +128,15 @@ worker_proc = None
 # metrics
 metrics = {
     'last_inference_ms': 0.0,
-    'inference_samples_ms': deque(maxlen=50), # Auto-pops old items efficiently
+    'inference_samples_ms': [],
     'worker_queue_len': 0,
     'processed_frames': 0,
 }
 metrics_lock = threading.Lock()
+
+# Trackers
+tracker1 = DeepSort(max_age=30, n_init=3, nn_budget=100)
+tracker2 = DeepSort(max_age=30, n_init=3, nn_budget=100)
 
 def get_color(class_id):
     colors = [
@@ -206,19 +209,12 @@ def worker_process(in_q, out_q, model_path, device_name, use_half, enable_masks,
         return
 
     dev = device_name
-    model = _YOLO(model_path)
     try:
-        model.to(dev)
-    except TypeError:
-        # Exported models (OpenVINO, ONNX, etc.) do not support .to()
-        pass
+        model = _YOLO(model_path).to(dev)
     except Exception:
         # fallback to CPU
         dev = 'cpu'
-        try:
-             model.to(dev)
-        except TypeError:
-             pass
+        model = _YOLO(model_path).to(dev)
 
     # open shared memory segments by name
     try:
@@ -251,12 +247,7 @@ def worker_process(in_q, out_q, model_path, device_name, use_half, enable_masks,
             try:
                 t0 = time.time()
                 with _torch.no_grad():
-                    # persist=True tells YOLO to remember this is a video stream, not random images
-                    # tracker="bytetrack.yaml" enables the lightweight tracker
-                    if use_half and dev != 'cpu':
-                        results = model.track(small, device=dev, half=True, persist=True, tracker="bytetrack.yaml", verbose=False)
-                    else:
-                        results = model.track(small, device=dev, half=False, persist=True, tracker="bytetrack.yaml", verbose=False)
+                    results = model(small, device=dev, half=use_half)
                 infer_ms = (time.time() - t0) * 1000.0
                 out_q.put({'metric_infer_ms': infer_ms})
             except Exception:
@@ -264,42 +255,23 @@ def worker_process(in_q, out_q, model_path, device_name, use_half, enable_masks,
 
             annotated = small.copy()
             try:
-                # Get boxes, scores, AND track_ids
                 boxes = results[0].boxes.xyxy.cpu().numpy()
                 scores = results[0].boxes.conf.cpu().numpy()
                 class_ids = results[0].boxes.cls.cpu().numpy()
-                
-                # Check if IDs exist (they might be None in the first few frames)
-                if results[0].boxes.id is not None:
-                    track_ids = results[0].boxes.id.int().cpu().numpy()
-                else:
-                    track_ids = [-1] * len(boxes) # -1 means "no ID yet"
             except Exception:
-                boxes, scores, class_ids, track_ids = [], [], [], []
+                boxes, scores, class_ids = [], [], []
 
             # build detection metadata in small (worker) coordinates
             detections = []
             try:
-                # Debug: print sizes if mismatched
-                if len(boxes) != len(track_ids):
-                     print(f"[WORKER {cam}] WARNING: boxes={len(boxes)}, track_ids={len(track_ids)}")
-                
-                for i, (box, score, cls, tid) in enumerate(zip(boxes, scores, class_ids, track_ids)):
+                for i, (box, score, cls) in enumerate(zip(boxes, scores, class_ids)):
                     x1, y1, x2, y2 = [int(v) for v in box]
                     cx = (x1 + x2) / 2.0
                     cy = (y1 + y2) / 2.0
                     bottom_cx = (x1 + x2) / 2.0
                     bottom_cy = float(y2)
-                    detections.append({
-                        'box': [x1, y1, x2, y2], 
-                        'score': float(score), 
-                        'cls': int(cls), 
-                        'track_id': int(tid),  # <--- SEND THIS ID
-                        'center': (cx, cy), 
-                        'bottom_center': (bottom_cx, bottom_cy)
-                    })
-            except Exception as e:
-                print(f"[WORKER {cam}] Error building detections:", e)
+                    detections.append({'box': [int(x1), int(y1), int(x2), int(y2)], 'score': float(score), 'cls': int(cls), 'center': (cx, cy), 'bottom_center': (bottom_cx, bottom_cy)})
+            except Exception:
                 detections = []
 
             # draw masks on small if enabled (use per-class color and alpha blending)
@@ -361,8 +333,6 @@ def worker_process(in_q, out_q, model_path, device_name, use_half, enable_masks,
         except Exception:
             out_q.put({'error': 'worker processing exception'})
 
-def save_snapshot_async(path, img):
-    cv2.imwrite(path, img)
 
 def inference_tick_loop(target_fps=8, inference_width=640, alpha=0.45):
     """Synchronized tick loop: on each tick, take latest raw frames for both streams,
@@ -399,23 +369,22 @@ def inference_tick_loop(target_fps=8, inference_width=640, alpha=0.45):
         for idx, frame in enumerate((f0, f1)):
             if frame is None:
                 continue
-
-            small_for_motion = frame[::4, ::4, :]
-
+            # downscale for motion detection
+            h, w = frame.shape[:2]
+            if w > MOTION_DETECTION_WIDTH:
+                scale = MOTION_DETECTION_WIDTH / float(w)
+                ms_w = int(w * scale)
+                ms_h = int(h * scale)
+                small_for_motion = cv2.resize(frame, (ms_w, ms_h))
+            else:
+                small_for_motion = cv2.resize(frame, (frame.shape[1], frame.shape[0]))
             gray = cv2.cvtColor(small_for_motion, cv2.COLOR_BGR2GRAY)
             if prev_small[idx] is not None:
-                # IMPORTANT: Slicing might result in slightly different sizes than previous frames 
-                # if the camera stream glitches. Ensure shapes match before diffing.
-                if gray.shape != prev_small[idx].shape:
-                    prev_small[idx] = gray
-                    continue
-
                 diff = cv2.absdiff(gray, prev_small[idx])
                 _, th = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
                 motion_score = (np.count_nonzero(th) / float(th.size))
                 if motion_score >= MOTION_THRESHOLD:
                     motion_present = True
-            
             prev_small[idx] = gray
 
         # choose inference FPS based on motion
@@ -478,6 +447,9 @@ def inference_tick_loop(target_fps=8, inference_width=640, alpha=0.45):
                 if 'metric_infer_ms' in res:
                     with metrics_lock:
                         metrics['last_inference_ms'] = res['metric_infer_ms']
+                        metrics['inference_samples_ms'].append(res['metric_infer_ms'])
+                        if len(metrics['inference_samples_ms']) > 50:
+                            metrics['inference_samples_ms'].pop(0)
                     continue
                 cam = int(res.get('cam', 0))
                 shape = res.get('shape')
@@ -495,10 +467,6 @@ def inference_tick_loop(target_fps=8, inference_width=640, alpha=0.45):
                         # scale detections (worker sent detections in small frame coords)
                         dets = res.get('detections') or []
                         try:
-                            # Debug log
-                            if len(dets) == 0 and res.get('has_objects'):
-                                print(f"[MAIN] Cam{cam} has_objects=True but dets is empty!")
-
                             ih, iw = h2, w2
                             oh, ow = orig_frame.shape[0], orig_frame.shape[1]
                             sx = float(ow) / float(iw) if iw > 0 else 1.0
@@ -511,11 +479,10 @@ def inference_tick_loop(target_fps=8, inference_width=640, alpha=0.45):
                                 sb = [int(b[0]*sx), int(b[1]*sy), int(b[2]*sx), int(b[3]*sy)]
                                 sc = (float(cx)*sx if cx is not None else None, float(cy)*sy if cy is not None else None)
                                 sbc = (float(bcx)*sx if bcx is not None else None, float(bcy)*sy if bcy is not None else None)
-                                scaled.append({'box': sb, 'score': d.get('score'), 'cls': d.get('cls'), 'track_id': d.get('track_id'), 'center': sc, 'bottom_center': sbc})
+                                scaled.append({'box': sb, 'score': d.get('score'), 'cls': d.get('cls'), 'center': sc, 'bottom_center': sbc})
                             raw_detections[cam] = scaled
-                        except Exception as e:
-                            print(f"[MAIN] Error scaling cam{cam}:", e)
-                            raw_detections[cam] = []
+                        except Exception:
+                            raw_detections[cam] = None
                         raw_detection_ts[cam] = res.get('ts', ts0 if cam == 0 else ts1)
                         with metrics_lock:
                             metrics['processed_frames'] += 1
@@ -550,10 +517,10 @@ def inference_tick_loop(target_fps=8, inference_width=640, alpha=0.45):
                                 sb = [int(b[0]*sx), int(b[1]*sy), int(b[2]*sx), int(b[3]*sy)]
                                 sc = (float(cx)*sx if cx is not None else None, float(cy)*sy if cy is not None else None)
                                 sbc = (float(bcx)*sx if bcx is not None else None, float(bcy)*sy if bcy is not None else None)
-                                scaled.append({'box': sb, 'score': d.get('score'), 'cls': d.get('cls'), 'track_id': d.get('track_id'), 'center': sc, 'bottom_center': sbc})
+                                scaled.append({'box': sb, 'score': d.get('score'), 'cls': d.get('cls'), 'center': sc, 'bottom_center': sbc})
                             raw_detections[cam] = scaled
                         except Exception:
-                            raw_detections[cam] = []
+                            raw_detections[cam] = None
                         raw_detection_ts[cam] = res.get('ts', ts0 if cam == 0 else ts1)
                     except Exception as e:
                         print('Error decoding worker result:', e)
@@ -574,16 +541,11 @@ def inference_tick_loop(target_fps=8, inference_width=640, alpha=0.45):
 
         # Attempt homography-based fusion if calibrated
         try:
-            if fusion_H is not None and raw_detections[0] is not None and raw_detections[1] is not None:
-                # Debug: only print when detections exist
-                if len(raw_detections[0]) > 0 or len(raw_detections[1]) > 0:
-                    print(f"[FUSION DEBUG] Cam0 detections: {len(raw_detections[0])}, Cam1 detections: {len(raw_detections[1])}")
+            if fusion_H is not None and raw_detections[0] and raw_detections[1]:
                 t0 = raw_detection_ts[0]
                 t1 = raw_detection_ts[1]
                 if abs(t0 - t1) <= (SYNC_TOL_MS / 1000.0):
                     matches = fusion.match_detections(raw_detections[0], raw_detections[1], fusion_H, max_dist_px=MATCH_MAX_DIST_PX)
-                    if len(matches) > 0:
-                        print(f"[FUSION DEBUG] Time sync OK, found {len(matches)} matches!")
                     fused_objects = []
                     now_ts = time.time()
 
@@ -679,8 +641,7 @@ def inference_tick_loop(target_fps=8, inference_width=640, alpha=0.45):
                                 crop = src_img[y1c:y2c, x1c:x2c].copy() if y2c>y1c and x2c>x1c else None
                                 if crop is not None:
                                     top_path = os.path.join(SNAPSHOT_DIR, f"id{attached['id']}_top_{int(now_ts)}.jpg")
-                                    # Non-blocking save
-                                    snapshot_executor.submit(save_snapshot_async, top_path, crop)
+                                    cv2.imwrite(top_path, crop)
                             if dst_img is not None and side_box:
                                 x1,y1,x2,y2 = side_box
                                 h,w = dst_img.shape[:2]
@@ -689,8 +650,7 @@ def inference_tick_loop(target_fps=8, inference_width=640, alpha=0.45):
                                 crop = dst_img[y1c:y2c, x1c:x2c].copy() if y2c>y1c and x2c>x1c else None
                                 if crop is not None:
                                     side_path = os.path.join(SNAPSHOT_DIR, f"id{attached['id']}_side_{int(now_ts)}.jpg")
-                                    # Non-blocking save
-                                    snapshot_executor.submit(save_snapshot_async, side_path, crop)
+                                    cv2.imwrite(side_path, crop)
 
                             if top_path or side_path:
                                 attached['snaps'].append({'ts': now_ts, 'top': os.path.basename(top_path) if top_path else None, 'side': os.path.basename(side_path) if side_path else None})
@@ -702,16 +662,12 @@ def inference_tick_loop(target_fps=8, inference_width=640, alpha=0.45):
                     # draw simple annotations for matches on both frames
                     with lock1:
                         if frames1[0] is not None:
-                            drawn_count = 0
                             for fo in fused_objects:
                                 tc = fo['top'].get('center')
                                 fid = fo.get('fid')
                                 if tc is not None and tc[0] is not None:
-                                    cv2.circle(frames1[0], (int(tc[0]), int(tc[1])), 10, (0, 0, 255), -1) # RED filled 10px
-                                    cv2.putText(frames1[0], f"FUSED {fid}", (int(tc[0]) + 10, int(tc[1]) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                                    drawn_count += 1
-                            if drawn_count > 0:
-                                print(f"[DRAW DEBUG] Drawn {drawn_count} fused objects on Cam0")
+                                    cv2.circle(frames1[0], (int(tc[0]), int(tc[1])), 6, (0, 255, 0), -1)
+                                    cv2.putText(frames1[0], f"ID{fid}", (int(tc[0]) + 6, int(tc[1]) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                     with lock2:
                         if frames2[0] is not None:
                             # --- NEW DEBUG CODE ---
@@ -723,19 +679,14 @@ def inference_tick_loop(target_fps=8, inference_width=640, alpha=0.45):
                                         # Project Top-Center -> Side-View
                                         proj_pt = fusion.project_point(fusion_H, c)
                                         if proj_pt:
-                                            # Draw BLUE circle for projection
-                                            cv2.circle(frames2[0], (int(proj_pt[0]), int(proj_pt[1])), 8, (255, 0, 0), 2)
-                            
-                            drawn_count = 0
+                                            # Draw RED circle for projection
+                                            cv2.circle(frames2[0], (int(proj_pt[0]), int(proj_pt[1])), 8, (0, 0, 255), 2)
                             for fo in fused_objects:
                                 sc = fo['side'].get('bottom_center')
                                 fid = fo.get('fid')
                                 if sc is not None and sc[0] is not None:
-                                    cv2.circle(frames2[0], (int(sc[0]), int(sc[1])), 10, (0, 0, 255), -1) # RED filled 10px
-                                    cv2.putText(frames2[0], f"FUSED {fid}", (int(sc[0]) + 10, int(sc[1]) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                                    drawn_count += 1
-                            if drawn_count > 0:
-                                print(f"[DRAW DEBUG] Drawn {drawn_count} fused objects on Cam1")
+                                    cv2.circle(frames2[0], (int(sc[0]), int(sc[1])), 6, (0, 255, 0), -1)
+                                    cv2.putText(frames2[0], f"ID{fid}", (int(sc[0]) + 6, int(sc[1]) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         except Exception:
             pass
 
