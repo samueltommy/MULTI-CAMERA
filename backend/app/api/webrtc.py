@@ -1,0 +1,106 @@
+import asyncio
+import json
+import traceback
+import threading
+import cv2
+import av
+from fractions import Fraction
+import time
+from aiohttp import web
+from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
+from app.services.camera import camera_manager
+
+class AnnotatedTrack(MediaStreamTrack):
+    kind = "video"
+    def __init__(self, idx, fps=15):
+        super().__init__()
+        self.idx = idx
+        self.fps = fps
+        self._start = None
+        self._last_tick = -1
+
+    async def recv(self):
+        if self._start is None:
+            self._start = time.time()
+            self._pts = 0
+        
+        while True:
+            cur_tick = camera_manager.get_tick()
+            if cur_tick == self._last_tick:
+                await asyncio.sleep(0.005)
+                continue
+                
+            frame = camera_manager.get_annotated_frame(self.idx)
+            if frame is None:
+                await asyncio.sleep(0.005)
+                continue
+            
+            self._last_tick = cur_tick
+            
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            video_frame = av.VideoFrame.from_ndarray(rgb, format='rgb24')
+            self._pts += int(90000 / self.fps)
+            video_frame.pts = self._pts
+            video_frame.time_base = Fraction(1, 90000)
+            await asyncio.sleep(1.0 / self.fps)
+            return video_frame
+
+def start_webrtc_server():
+    pcs = set()
+
+    async def offer(request):
+        # Allow CORS for all origins
+        headers = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type'
+        }
+
+        try:
+            params = await request.json()
+            offer = RTCSessionDescription(sdp=params['sdp'], type=params['type'])
+            pc = RTCPeerConnection()
+            pcs.add(pc)
+
+            cam_idx = int(request.query.get('cam', '1')) - 1
+            await pc.setRemoteDescription(offer)
+            track = AnnotatedTrack(cam_idx, fps=15)
+            pc.addTrack(track)
+
+            @pc.on('connectionstatechange')
+            def on_state():
+                if pc.connectionState == 'failed':
+                    asyncio.ensure_future(pc.close())
+            
+            answer = await pc.createAnswer()
+            await pc.setLocalDescription(answer)
+            return web.Response(content_type='application/json', text=json.dumps({
+                'sdp': pc.localDescription.sdp,
+                'type': pc.localDescription.type
+            }), headers=headers)
+        except Exception as e:
+            return web.Response(status=500, text=str(e), headers=headers)
+
+    async def options(request):
+        return web.Response(headers={
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type'
+        })
+
+    app = web.Application()
+    app.router.add_post('/offer', offer)
+    app.router.add_options('/offer', options)
+    
+    runner = web.AppRunner(app)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(runner.setup())
+    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    print("Starting WebRTC server on 8080")
+    loop.run_until_complete(site.start())
+    loop.run_forever()
+
+def run_webrtc_thread():
+    t = threading.Thread(target=start_webrtc_server, daemon=True)
+    t.start()

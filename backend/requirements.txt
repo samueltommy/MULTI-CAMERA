@@ -1,0 +1,12 @@
+opencv-python
+opencv-contrib-python
+ultralytics
+flask
+deep-sort-realtime
+aiortc
+av
+aiohttp
+sqlalchemy
+alembic
+psycopg2-binary
+python-dotenv
