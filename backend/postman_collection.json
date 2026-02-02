@@ -1,0 +1,102 @@
+{
+  "info": {
+    "name": "MULTI-CAMERA Backend",
+    "description": "Postman collection for backend endpoints and WebRTC offer (import into Postman).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_postman_id": "multi-camera-backend"
+  },
+  "variable": [
+    { "key": "host", "value": "127.0.0.1" },
+    { "key": "backend_port", "value": "5000" },
+    { "key": "webrtc_port", "value": "8080" },
+    { "key": "cam", "value": "1" },
+    { "key": "snapshot_filename", "value": "id1_top_1234567890.jpg" }
+  ],
+  "item": [
+    {
+      "name": "Index (UI)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": { "raw": "http://{{host}}:{{backend_port}}/", "host": ["http://{{host}}:{{backend_port}}"], "path": ["/"] }
+      },
+      "response": []
+    },
+    {
+      "name": "Get ICE servers",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": { "raw": "http://{{host}}:{{backend_port}}/ice", "host": ["http://{{host}}:{{backend_port}}"], "path": ["ice"] }
+      }
+    },
+    {
+      "name": "WebRTC Offer (POST) - Offer to aiortc server",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"sdp\": \"<offer_sdp_here>\",\n  \"type\": \"offer\"\n}"
+        },
+        "url": { "raw": "http://{{host}}:{{webrtc_port}}/offer?cam={{cam}}", "host": ["http://{{host}}:{{webrtc_port}}"], "path": ["offer"], "query": [{"key":"cam","value":"{{cam}}"}] }
+      },
+      "event": [
+        { "listen": "prerequest", "script": { "exec": ["// Ensure Content-Type header is present for CORS preflight"], "type": "text/javascript" } }
+      ]
+    },
+    {
+      "name": "WebRTC Offer - OPTIONS (preflight)",
+      "request": {
+        "method": "OPTIONS",
+        "header": [
+          { "key": "Access-Control-Request-Method", "value": "POST" },
+          { "key": "Access-Control-Request-Headers", "value": "Content-Type" }
+        ],
+        "url": { "raw": "http://{{host}}:{{webrtc_port}}/offer?cam={{cam}}", "host": ["http://{{host}}:{{webrtc_port}}"], "path": ["offer"], "query": [{"key":"cam","value":"{{cam}}"}] }
+      }
+    },
+    {
+      "name": "Calibrate Compute (POST)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"src\": [[100,200],[200,200],[200,300],[100,300]],\n  \"dst\": [[110,210],[210,210],[210,310],[110,310]]\n}"
+        },
+        "url": { "raw": "http://{{host}}:{{backend_port}}/calibrate/compute", "host": ["http://{{host}}:{{backend_port}}"], "path": ["calibrate","compute"] }
+      }
+    },
+    {
+      "name": "Fused Tracks (GET)",
+      "request": {
+        "method": "GET",
+        "url": { "raw": "http://{{host}}:{{backend_port}}/fused", "host": ["http://{{host}}:{{backend_port}}"], "path": ["fused"] }
+      }
+    },
+    {
+      "name": "Snapshots (GET)",
+      "request": {
+        "method": "GET",
+        "url": { "raw": "http://{{host}}:{{backend_port}}/snapshots/{{snapshot_filename}}", "host": ["http://{{host}}:{{backend_port}}"], "path": ["snapshots","{{snapshot_filename}}"] }
+      },
+      "description": "Replace {{snapshot_filename}} with actual filename returned by /fused"
+    },
+    {
+      "name": "Streams / Metrics",
+      "item": [
+        {
+          "name": "Streams (GET)",
+          "request": { "method": "GET", "url": { "raw": "http://{{host}}:{{backend_port}}/streams", "host": ["http://{{host}}:{{backend_port}}"], "path": ["streams"] } }
+        },
+        {
+          "name": "Metrics (GET)",
+          "request": { "method": "GET", "url": { "raw": "http://{{host}}:{{backend_port}}/metrics", "host": ["http://{{host}}:{{backend_port}}"], "path": ["metrics"] } }
+        }
+      ]
+    }
+  ]
+}

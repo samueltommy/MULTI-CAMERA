@@ -14,7 +14,7 @@ try:
     OUTPUT_FILE = settings.HOMOGRAPHY_PATH
 except ImportError:
     print("Could not import settings from app.core.config. Using defaults/env vars.")
-    RTSP_1 = os.environ.get('RTSP_URL_1', 'rtsp://admin:admin123456@192.168.1.6:554/ch=1?subtype=1')
+    RTSP_1 = os.environ.get('RTSP_URL_1', 'rtsp://admin:admin123456@192.168.1.5:554/ch=1?subtype=1')
     RTSP_2 = os.environ.get('RTSP_URL_2', 'rtsp://admin:admin123456@192.168.1.4:554/ch=1?subtype=1')
     OUTPUT_FILE = os.environ.get('HOMOGRAPHY_PATH', '../homography_top_to_side.npy')
 
