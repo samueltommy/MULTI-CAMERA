@@ -23,6 +23,8 @@ class Config:
 
     # Model
     MODEL_PATH = os.environ.get('MODEL_PATH', '../models/yolov8s-seg_openvino_model/')
+    CONF_THRESHOLD_1 = float(os.environ.get('CONF_THRESHOLD_1', '0.5'))
+    CONF_THRESHOLD_2 = float(os.environ.get('CONF_THRESHOLD_2', '0.3'))
     TARGET_FPS = int(os.environ.get('TARGET_FPS', '12'))
     INFERENCE_WIDTH = int(os.environ.get('INFERENCE_WIDTH', '480'))
     ENABLE_MASKS = os.environ.get('ENABLE_MASKS', '1').lower() in ('1', 'true', 'yes')

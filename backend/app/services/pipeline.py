@@ -14,6 +14,29 @@ class PipelineService:
         self.thread = None
         self.raw_detections = [[], []]
         self.raw_detection_ts = [0.0, 0.0]
+        self.session_active = False
+        self.session_end_time = 0.0
+        self.best_session_result = {
+            'count': 0,
+            'detections': [[], []],
+            'frames': [None, None],
+            'timestamp': 0.0
+        }
+
+    def start_session(self, duration=60):
+        print(f"Starting triggered session for {duration} seconds")
+        self.best_session_result = {
+            'count': 0,
+            'detections': [[], []],
+            'frames': [None, None],
+            'timestamp': 0.0
+        }
+        self.session_end_time = time.time() + duration
+        self.session_active = True
+
+    def stop_session(self):
+        self.session_active = False
+        print("Session force stopped")
 
     def start(self):
         self.inference_manager.start()
@@ -34,6 +57,10 @@ class PipelineService:
         
         while self.running:
             t0 = time.time()
+
+            if not self.session_active:
+                time.sleep(0.1)
+                continue
             
             # 1. Get Frames
             f0, ts0 = camera_manager.get_raw_frame(0)
@@ -61,7 +88,7 @@ class PipelineService:
                         motion_present = True
                 prev_small[idx] = gray
 
-            target_fps = settings.MOTION_HIGH_FPS if motion_present else settings.MOTION_LOW_FPS
+            target_fps = settings.MOTION_HIGH_FPS if (motion_present or self.session_active) else settings.MOTION_LOW_FPS
             tick_interval = 1.0 / target_fps
             
             # 3. Send to Inference
@@ -126,7 +153,25 @@ class PipelineService:
                     f0, f1
                 )
 
-            # 6. Annotate Fusion on Frames (Draw circles) & Update Manager
+            # 6. Session Logic (Best Result Tracking)
+            if self.session_active:
+                if time.time() > self.session_end_time:
+                    self.session_active = False
+                    print(f"Session finished. Best count: {self.best_session_result['count']}")
+                else:
+                    # Determine "best result" by total unique fused tracks or total detections?
+                    # Using current_fused count as a measure of "biggest result"
+                    fused_count = len(current_fused)
+                    if fused_count > self.best_session_result['count']:
+                        self.best_session_result = {
+                            'count': fused_count,
+                            'detections': [list(self.raw_detections[0]), list(self.raw_detections[1])],
+                            'frames': [f0.copy() if f0 is not None else None, f1.copy() if f1 is not None else None],
+                            'timestamp': time.time(),
+                            'fused': current_fused
+                        }
+
+            # 7. Annotate Fusion on Frames (Draw circles) & Update Manager
             for i in range(2):
                 frame_out = temp_outs[i]
                 if frame_out is not None:

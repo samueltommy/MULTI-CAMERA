@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
@@ -21,6 +21,24 @@
   </head>
   <body>
     <h1>Real-time YOLOv8 Segmentation (WebRTC)</h1>
+
+    <div
+      style="
+        margin-bottom: 20px;
+        padding: 10px;
+        border: 1px solid #ccc;
+        background: #fff;
+      "
+    >
+      <button id="triggerBtn" style="padding: 10px 20px; cursor: pointer">
+        Start Capturing Best Result (1 min)
+      </button>
+      <span
+        id="triggerStatus"
+        style="margin-left: 20px; font-weight: bold"
+      ></span>
+    </div>
+
     <div style="display: flex; gap: 20px; align-items: flex-start">
       <div>
         <video
@@ -76,7 +94,7 @@
             method: "POST",
             body: JSON.stringify({ sdp: offer.sdp, type: offer.type }),
             headers: { "Content-Type": "application/json" },
-          }
+          },
         );
         const ans = await resp.json();
         await pc.setRemoteDescription(new RTCSessionDescription(ans));
@@ -101,6 +119,69 @@
         };
         tryStart(1, v1);
         tryStart(2, v2);
+        // Trigger logic
+        const btn = document.getElementById("triggerBtn");
+        const status = document.getElementById("triggerStatus");
+        
+        let pollingActive = false;
+
+        async function updateStatus() {
+          try {
+            const r = await fetch("/trigger/status");
+            if (r.ok) {
+              const j = await r.json();
+              if (j.active) {
+                status.innerText = `Active! Time left: ${Math.round(j.time_left)}s | Best result so far: ${j.best_count} objects`;
+                btn.disabled = true;
+                // Continue polling while active
+                setTimeout(updateStatus, 1000);
+              } else {
+                if (j.best_count > 0) {
+                  status.innerText = `Idle (Last best result: ${j.best_count} objects)`;
+                } else {
+                  status.innerText = "Idle";
+                }
+                btn.disabled = false;
+                pollingActive = false;
+              }
+            }
+          } catch (e) {
+            console.error("Polling error", e);
+            pollingActive = false;
+          }
+        }
+
+        btn.onclick = async () => {
+          btn.disabled = true;
+          const resp = await fetch("/trigger", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ duration: 60 }),
+          });
+          
+          if (resp.ok && !pollingActive) {
+            pollingActive = true;
+            updateStatus();
+          }
+        };
+
+        // Check once on load, and start polling ONLY if already active (e.g. after refresh)
+        (async () => {
+          const r = await fetch("/trigger/status");
+          if (r.ok) {
+            const j = await r.json();
+            if (j.active) {
+              pollingActive = true;
+              updateStatus();
+            } else {
+              if (j.best_count > 0) {
+                status.innerText = `Idle (Last best result: ${j.best_count} objects)`;
+              } else {
+                status.innerText = "Idle";
+              }
+            }
+          }
+        })();
       });
     </script>
   </body>

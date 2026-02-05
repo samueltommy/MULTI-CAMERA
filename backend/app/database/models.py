@@ -36,3 +36,28 @@ class FusedObject(Base):
                 "side": [self.side_center_x, self.side_center_y]
             }
         }
+
+class Calibration(Base):
+    __tablename__ = 'calibrations'
+
+    id = Column(Integer, primary_key=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    name = Column(String, nullable=True)
+    
+    # Store matrix as a JSON string
+    matrix_json = Column(String, nullable=False)
+    
+    # Metadata
+    is_active = Column(Integer, default=1) # 1 for active, 0 for archive
+    notes = Column(String, nullable=True)
+
+    def to_dict(self):
+        import json
+        return {
+            "id": self.id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "name": self.name,
+            "matrix": json.loads(self.matrix_json),
+            "is_active": self.is_active == 1
+        }
+

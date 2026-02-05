@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+<!doctype html>
 <html>
   <head>
     <meta charset="utf-8" />
@@ -10,6 +10,15 @@
       Provide JSON arrays of source (top) and destination (side) image points.
       Each array is a list of [x,y]. Need at least 4 pairs.
     </p>
+    <div>
+      <label>Calibration Name:</label><br />
+      <input
+        type="text"
+        id="name"
+        value="Manual Calibration"
+        style="width: 400px"
+      />
+    </div>
     <div>
       <label>Top points (src):</label><br />
       <textarea id="src" rows="6" cols="60">
@@ -23,25 +32,47 @@
       >
     </div>
     <button id="compute">Compute & Save</button>
+    <div id="history-container" style="margin-top: 20px">
+      <h3>History</h3>
+      <ul id="history-list"></ul>
+    </div>
     <pre id="result"></pre>
 
     <script>
+      async function loadHistory() {
+        const r = await fetch("/calibrate/history");
+        if (r.ok) {
+          const j = await r.json();
+          const list = document.getElementById("history-list");
+          list.innerHTML = "";
+          j.history.forEach((h) => {
+            const li = document.createElement("li");
+            li.textContent = `${h.created_at} - ${h.name} ${h.is_active ? "(ACTIVE)" : ""}`;
+            list.appendChild(li);
+          });
+        }
+      }
+
+      loadHistory();
+
       document
         .getElementById("compute")
         .addEventListener("click", async function () {
           const src = JSON.parse(document.getElementById("src").value);
           const dst = JSON.parse(document.getElementById("dst").value);
+          const name = document.getElementById("name").value;
           const res = await fetch("/calibrate/compute", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ src: src, dst: dst }),
+            body: JSON.stringify({ src: src, dst: dst, name: name }),
           });
           const j = await res.json();
           document.getElementById("result").textContent = JSON.stringify(
             j,
             null,
-            2
+            2,
           );
+          loadHistory();
         });
     </script>
   </body>

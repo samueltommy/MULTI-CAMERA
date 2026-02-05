@@ -1,9 +1,12 @@
 import numpy as np
 import time
 import math
+import json
 from app.core.config import settings
 from app.utils.geometry import project_point
 from app.services.snapshot import snapshot_service
+from app.database.session import SessionLocal
+from app.database.models import Calibration
 
 class FusionService:
     def __init__(self):
@@ -13,16 +16,51 @@ class FusionService:
         self.fused_id_counter = 1
         
     def load_homography(self):
+        # Try loading from DB first
+        try:
+            db = SessionLocal()
+            cal = db.query(Calibration).filter(Calibration.is_active == 1).order_by(Calibration.created_at.desc()).first()
+            if cal:
+                self.H = np.array(json.loads(cal.matrix_json))
+                print(f"Loaded homography from DB (ID: {cal.id})")
+                db.close()
+                return
+            db.close()
+        except Exception as e:
+            print(f"Failed to load homography from DB: {e}")
+
+        # Fallback to file
         try:
            self.H = np.load(settings.HOMOGRAPHY_PATH)
-           print(f"Loaded homography from {settings.HOMOGRAPHY_PATH}")
+           print(f"Loaded homography fallback from {settings.HOMOGRAPHY_PATH}")
         except Exception:
             self.H = None
             print("Homography not loaded.")
 
-    def set_homography(self, H):
+    def set_homography(self, H, name="Manual Calibration"):
         self.H = H
-        np.save(settings.HOMOGRAPHY_PATH, H)
+        # Update file fallback
+        try:
+            np.save(settings.HOMOGRAPHY_PATH, H)
+        except: pass
+        
+        # Save to DB
+        try:
+            db = SessionLocal()
+            # Deactivate old ones? (Optional but keeps history clean)
+            db.query(Calibration).update({Calibration.is_active: 0})
+            
+            new_cal = Calibration(
+                name=name,
+                matrix_json=json.dumps(H.tolist()),
+                is_active=1
+            )
+            db.add(new_cal)
+            db.commit()
+            print(f"Saved new homography to DB (ID: {new_cal.id})")
+            db.close()
+        except Exception as e:
+            print(f"Failed to save homography to DB: {e}")
 
     def match_detections(self, dets_top, dets_side):
         matches = []

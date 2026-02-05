@@ -1,14 +1,30 @@
 from flask import Blueprint, jsonify, request, send_from_directory, render_template, current_app
 from app.services.fusion import fusion_service
+from app.services.pipeline import pipeline_service
 from app.core.config import settings
 import numpy as np
 import os
+import time
 
 api = Blueprint('api', __name__)
 
 @api.route('/')
 def index():
     return render_template('index.html')
+
+@api.route('/trigger', methods=['POST'])
+def trigger_session():
+    duration = int(request.json.get('duration', 60))
+    pipeline_service.start_session(duration)
+    return jsonify({'status': 'started', 'duration': duration})
+
+@api.route('/trigger/status')
+def trigger_status():
+    return jsonify({
+        'active': pipeline_service.session_active,
+        'best_count': pipeline_service.best_session_result['count'],
+        'time_left': max(0, pipeline_service.session_end_time - time.time()) if pipeline_service.session_active else 0
+    })
 
 @api.route('/ice')
 def ice_config():
@@ -35,6 +51,7 @@ def calibrate_compute():
         data = request.get_json()
         src = data.get('src')
         dst = data.get('dst')
+        name = data.get('name', 'Manual Calibration')
         if not src or not dst:
             return jsonify({'error': 'invalid points'}), 400
         
@@ -43,10 +60,20 @@ def calibrate_compute():
         if H is None:
              return jsonify({'error': 'failed'}), 500
         
-        fusion_service.set_homography(H)
+        fusion_service.set_homography(H, name=name)
         return jsonify({'ok': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@api.route('/calibrate/history')
+def calibrate_history():
+    from app.database.session import SessionLocal
+    from app.database.models import Calibration
+    db = SessionLocal()
+    history = db.query(Calibration).order_by(Calibration.created_at.desc()).all()
+    out = [c.to_dict() for c in history]
+    db.close()
+    return jsonify({'history': out})
 
 @api.route('/fused')
 def fused_list():

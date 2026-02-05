@@ -7,10 +7,11 @@ import traceback
 import torch
 from ultralytics import YOLO
 
-def worker_process_func(in_q, out_q, model_path, device_name, use_half, enable_masks, alpha, inference_width, shm_in_names_arg, shm_out_names_arg, shm_max_w_arg, shm_max_h_arg):
+def worker_process_func(in_q, out_q, model_path, device_name, use_half, enable_masks, alpha, inference_width, shm_in_names_arg, shm_out_names_arg, shm_max_w_arg, shm_max_h_arg, conf_1, conf_2):
     try:
         dev = device_name
         model = YOLO(model_path)
+        conf_thresholds = [conf_1, conf_2]
         try:
             model.to(dev)
             if dev != 'cpu' and use_half:
@@ -48,14 +49,16 @@ def worker_process_func(in_q, out_q, model_path, device_name, use_half, enable_m
                 t0 = time.time()
                 # Run inference
                 try:
+                    conf = conf_thresholds[cam] if cam < len(conf_thresholds) else 0.25
                     if use_half and dev != 'cpu':
-                        results = model.track(small, device=dev, half=True, persist=True, tracker="bytetrack.yaml", verbose=False)
+                        results = model.track(small, device=dev, half=True, persist=True, tracker="bytetrack.yaml", verbose=False, conf=conf)
                     else:
-                        results = model.track(small, device=dev, half=False, persist=True, tracker="bytetrack.yaml", verbose=False)
+                        results = model.track(small, device=dev, half=False, persist=True, tracker="bytetrack.yaml", verbose=False, conf=conf)
                     infer_ms = (time.time() - t0) * 1000.0
                     out_q.put({'metric_infer_ms': infer_ms})
                 except Exception:
-                    results = model(small, device=dev, half=False)
+                    conf = conf_thresholds[cam] if cam < len(conf_thresholds) else 0.25
+                    results = model(small, device=dev, half=False, conf=conf)
 
                 annotated = small.copy()
                 boxes, scores, class_ids, track_ids = [], [], [], []
@@ -185,7 +188,9 @@ class InferenceManager:
                 self.shm_in_names, 
                 self.shm_out_names, 
                 self.shm_max_w, 
-                self.shm_max_h
+                self.shm_max_h,
+                self.config.CONF_THRESHOLD_1,
+                self.config.CONF_THRESHOLD_2
             ),
             daemon=True
         )
