@@ -50,15 +50,22 @@ def worker_process_func(in_q, out_q, model_path, device_name, use_half, enable_m
                 # Run inference
                 try:
                     conf = conf_thresholds[cam] if cam < len(conf_thresholds) else 0.25
+                    is_yolo26 = "yolo26" in model_path.lower()
+                    
                     if use_half and dev != 'cpu':
-                        results = model.track(small, device=dev, half=True, persist=True, tracker="bytetrack.yaml", verbose=False, conf=conf)
+                        results = model.track(small, device=dev, half=True, persist=True, 
+                                            tracker="bytetrack.yaml", verbose=False, conf=conf,
+                                            end2end=is_yolo26)
                     else:
-                        results = model.track(small, device=dev, half=False, persist=True, tracker="bytetrack.yaml", verbose=False, conf=conf)
+                        results = model.track(small, device=dev, half=False, persist=True, 
+                                            tracker="bytetrack.yaml", verbose=False, conf=conf,
+                                            end2end=is_yolo26)
                     infer_ms = (time.time() - t0) * 1000.0
                     out_q.put({'metric_infer_ms': infer_ms})
                 except Exception:
                     conf = conf_thresholds[cam] if cam < len(conf_thresholds) else 0.25
-                    results = model(small, device=dev, half=False, conf=conf)
+                    is_yolo26 = "yolo26" in model_path.lower()
+                    results = model(small, device=dev, half=False, conf=conf, end2end=is_yolo26)
 
                 annotated = small.copy()
                 boxes, scores, class_ids, track_ids = [], [], [], []
