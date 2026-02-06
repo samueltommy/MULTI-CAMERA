@@ -22,7 +22,7 @@ class Config:
     ASSOC_TIME_DECAY = float(os.environ.get('ASSOC_TIME_DECAY', '3.0'))
 
     # Model
-    MODEL_PATH = os.environ.get('MODEL_PATH', '../models/yolov8s-seg_openvino_model/')
+    MODEL_PATH = os.environ.get('MODEL_PATH', '../models/yolo26s-seg_openvino_model/')
     CONF_THRESHOLD_1 = float(os.environ.get('CONF_THRESHOLD_1', '0.5'))
     CONF_THRESHOLD_2 = float(os.environ.get('CONF_THRESHOLD_2', '0.3'))
     TARGET_FPS = int(os.environ.get('TARGET_FPS', '12'))

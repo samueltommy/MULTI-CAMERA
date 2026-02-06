@@ -66,6 +66,8 @@ def worker_process_func(in_q, out_q, model_path, device_name, use_half, enable_m
                 try:
                     res = results[0]
                     boxes = res.boxes.xyxy.cpu().numpy()
+                    if res.boxes.id is not None:
+                        track_ids = res.boxes.id.int().cpu().numpy()
                     scores = res.boxes.conf.cpu().numpy()
                     class_ids = res.boxes.cls.cpu().numpy()
                     if res.boxes.id is not None:

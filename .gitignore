@@ -89,9 +89,7 @@ htmlcov/
 .pytest_cache/
 
 # Large files / models / snapshots
-models/
 snapshots/
-*.pt
 *.pth
 *.npy
 
