@@ -30,7 +30,6 @@ class AnnotatedTrack(MediaStreamTrack):
     async def recv(self):
         if self._start is None:
             self._start = time.time()
-            self._pts = 0
         
         while True:
             if self.mode == "calibrate":
@@ -45,25 +44,28 @@ class AnnotatedTrack(MediaStreamTrack):
                     aruco.drawDetectedMarkers(frame, corners, ids)
                 
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # Throttling for calibrate mode to avoid high CPU
+                await asyncio.sleep(1.0 / self.fps)
             else:
                 cur_tick = camera_manager.get_tick()
                 if cur_tick == self._last_tick:
-                    await asyncio.sleep(0.005)
+                    await asyncio.sleep(0.01)
                     continue
                     
                 frame = camera_manager.get_annotated_frame(self.idx)
                 if frame is None:
-                    await asyncio.sleep(0.005)
+                    await asyncio.sleep(0.01)
                     continue
                 
                 self._last_tick = cur_tick
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
             video_frame = av.VideoFrame.from_ndarray(rgb, format='rgb24')
-            self._pts += int(90000 / self.fps)
-            video_frame.pts = self._pts
+            
+            # PTS based on wall clock for steady streaming
+            elapsed = time.time() - self._start
+            video_frame.pts = int(elapsed * 90000)
             video_frame.time_base = Fraction(1, 90000)
-            await asyncio.sleep(1.0 / self.fps)
             return video_frame
 
 def start_webrtc_server():

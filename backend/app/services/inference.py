@@ -233,7 +233,8 @@ class InferenceManager:
             small = cv2.resize(small, (self.shm_max_w, self.shm_max_h))
 
         try:
-             shm = shared_memory.SharedMemory(name=self.shm_in_names[cam_idx])
+             # Use pre-opened shm to avoid handle leaks
+             shm = self.shms[cam_idx * 2]
              dest = np.ndarray((self.shm_max_h, self.shm_max_w, 3), dtype=np.uint8, buffer=shm.buf)
              dest[:small.shape[0], :small.shape[1], :] = small
              try:
@@ -256,7 +257,8 @@ class InferenceManager:
     def resolve_shm_image(self, cam_idx, shape):
         # Read back image from SHM
         try:
-            shm = shared_memory.SharedMemory(name=self.shm_out_names[cam_idx])
+            # Use pre-opened shm to avoid handle leaks
+            shm = self.shms[cam_idx * 2 + 1]
             h, w, c = shape
             arr = np.ndarray((self.shm_max_h, self.shm_max_w, 3), dtype=np.uint8, buffer=shm.buf)
             return arr[:h, :w, :].copy()
