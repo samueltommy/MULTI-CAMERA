@@ -1,44 +1,141 @@
 <!doctype html>
-<html>
+<html lang="en">
   <head>
-    <meta charset="utf-8" />
-    <title>Calibration</title>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Auto Calibration</title>
+    <style>
+      body {
+        font-family: sans-serif;
+        background-color: #f0f0f0;
+        margin: 20px;
+        text-align: center;
+      }
+      .camera-container {
+        display: flex;
+        justify-content: center;
+        gap: 20px;
+        margin-bottom: 20px;
+      }
+      video {
+        width: 480px;
+        background: #000;
+        border: 2px solid #333;
+      }
+      .controls {
+        background: white;
+        padding: 20px;
+        border-radius: 8px;
+        display: inline-block;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+      }
+      button {
+        padding: 12px 24px;
+        font-size: 16px;
+        cursor: pointer;
+        border: none;
+        border-radius: 4px;
+        margin: 0 10px;
+      }
+      #auto-calibrate {
+        background-color: #4caf50;
+        color: white;
+      }
+      #auto-calibrate:disabled {
+        background-color: #ccc;
+      }
+      .back-btn {
+        background-color: #2196f3;
+        color: white;
+        text-decoration: none;
+        padding: 12px 24px;
+        display: inline-block;
+      }
+      #status-msg {
+        margin-top: 15px;
+        font-weight: bold;
+      }
+      .history-section {
+        margin-top: 30px;
+        text-align: left;
+        max-width: 800px;
+        margin-left: auto;
+        margin-right: auto;
+      }
+    </style>
   </head>
   <body>
-    <h2>Compute Homography</h2>
+    <h1>System Calibration</h1>
     <p>
-      Provide JSON arrays of source (top) and destination (side) image points.
-      Each array is a list of [x,y]. Need at least 4 pairs.
+      Ensure ArUco markers are visible in both cameras. The system will
+      automatically capture points.
     </p>
-    <div>
-      <label>Calibration Name:</label><br />
-      <input
-        type="text"
-        id="name"
-        value="Manual Calibration"
-        style="width: 400px"
-      />
+
+    <div class="camera-container">
+      <div>
+        <video id="video1" autoplay playsinline muted></video>
+        <div>Top View (Camera 1)</div>
+      </div>
+      <div>
+        <video id="video2" autoplay playsinline muted></video>
+        <div>Side View (Camera 2)</div>
+      </div>
     </div>
-    <div>
-      <label>Top points (src):</label><br />
-      <textarea id="src" rows="6" cols="60">
-[[100,100],[400,100],[400,400],[100,400]]</textarea
-      >
+
+    <div class="controls">
+      <button id="reset-btn" style="background-color: #f44336; color: white">
+        Reset
+      </button>
+      <button id="capture-btn" style="background-color: #ff9800; color: white">
+        Capture Point
+      </button>
+      <button id="finish-btn" style="background-color: #4caf50; color: white">
+        Save Calibration
+      </button>
+      <a href="/" class="back-btn">Back to Dashboard</a>
+      <div id="status-msg">Ready</div>
     </div>
-    <div>
-      <label>Side points (dst):</label><br />
-      <textarea id="dst" rows="6" cols="60">
-[[120,200],[500,220],[480,520],[140,500]]</textarea
-      >
-    </div>
-    <button id="compute">Compute & Save</button>
-    <div id="history-container" style="margin-top: 20px">
-      <h3>History</h3>
+
+    <div class="history-section">
+      <h3>Calibration History</h3>
       <ul id="history-list"></ul>
     </div>
-    <pre id="result"></pre>
 
     <script>
+      async function startWebRTC(cam, videoEl) {
+        let iceServers = [{ urls: "stun:stun.l.google.com:19302" }];
+        try {
+          const r = await fetch("/ice");
+          if (r.ok) {
+            const j = await r.json();
+            if (j && j.iceServers) iceServers = j.iceServers;
+          }
+        } catch (e) {}
+
+        const pc = new RTCPeerConnection({ iceServers });
+        pc.ontrack = (evt) => (videoEl.srcObject = evt.streams[0]);
+        pc.addTransceiver("video", { direction: "recvonly" });
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        const resp = await fetch(
+          `http://${location.hostname}:8080/offer?cam=${cam}&mode=calibrate`,
+          {
+            method: "POST",
+            body: JSON.stringify({ sdp: offer.sdp, type: offer.type }),
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+        const ans = await resp.json();
+        await pc.setRemoteDescription(new RTCSessionDescription(ans));
+      }
+
+      window.addEventListener("DOMContentLoaded", () => {
+        startWebRTC(1, document.getElementById("video1"));
+        startWebRTC(2, document.getElementById("video2"));
+      });
+
       async function loadHistory() {
         const r = await fetch("/calibrate/history");
         if (r.ok) {
@@ -47,33 +144,74 @@
           list.innerHTML = "";
           j.history.forEach((h) => {
             const li = document.createElement("li");
-            li.textContent = `${h.created_at} - ${h.name} ${h.is_active ? "(ACTIVE)" : ""}`;
+            li.innerHTML = `${h.created_at} - <b>${h.name}</b> ${h.is_active ? "<span style='color:green'>(ACTIVE)</span>" : ""}`;
             list.appendChild(li);
           });
         }
       }
 
-      loadHistory();
+      const statusMsg = document.getElementById("status-msg");
 
       document
-        .getElementById("compute")
-        .addEventListener("click", async function () {
-          const src = JSON.parse(document.getElementById("src").value);
-          const dst = JSON.parse(document.getElementById("dst").value);
-          const name = document.getElementById("name").value;
-          const res = await fetch("/calibrate/compute", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ src: src, dst: dst, name: name }),
-          });
-          const j = await res.json();
-          document.getElementById("result").textContent = JSON.stringify(
-            j,
-            null,
-            2,
-          );
-          loadHistory();
+        .getElementById("reset-btn")
+        .addEventListener("click", async () => {
+          await fetch("/calibrate/reset", { method: "POST" });
+          statusMsg.textContent = "Calibration reset. Ready to capture.";
+          statusMsg.style.color = "blue";
         });
+
+      document
+        .getElementById("capture-btn")
+        .addEventListener("click", async () => {
+          statusMsg.textContent = "Capturing...";
+          try {
+            const r = await fetch("/calibrate/capture", { method: "POST" });
+            const j = await r.json();
+            if (j.ok) {
+              statusMsg.textContent = j.message;
+              statusMsg.style.color = "green";
+            } else {
+              statusMsg.textContent = "Error: " + j.error;
+              statusMsg.style.color = "red";
+            }
+          } catch (e) {
+            statusMsg.textContent = "Server error during capture";
+            statusMsg.style.color = "red";
+          }
+        });
+
+      document
+        .getElementById("finish-btn")
+        .addEventListener("click", async () => {
+          const name = prompt(
+            "Enter a name for this calibration:",
+            "Web Calibration",
+          );
+          if (name === null) return;
+
+          statusMsg.textContent = "Saving...";
+          try {
+            const r = await fetch("/calibrate/finish", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ name }),
+            });
+            const j = await r.json();
+            if (j.ok) {
+              statusMsg.textContent = "Success! " + j.message;
+              statusMsg.style.color = "green";
+              loadHistory();
+            } else {
+              statusMsg.textContent = "Error: " + j.error;
+              statusMsg.style.color = "red";
+            }
+          } catch (e) {
+            statusMsg.textContent = "Server error during finish";
+            statusMsg.style.color = "red";
+          }
+        });
+
+      loadHistory();
     </script>
   </body>
 </html>

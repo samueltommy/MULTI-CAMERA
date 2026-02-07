@@ -66,10 +66,6 @@ def setup_database():
         cur.close()
         conn.close()
         
-        print("\nNext steps:")
-        print("1. cd backend")
-        print("2. alembic upgrade head")
-
     except Exception as e:
         print(f"An error occurred: {e}")
 

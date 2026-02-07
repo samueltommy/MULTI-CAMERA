@@ -10,14 +10,22 @@ from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
 from app.services.camera import camera_manager
 
+import cv2.aruco as aruco
+
+# Initialize ArUco detector
+aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+aruco_params = aruco.DetectorParameters()
+aruco_detector = aruco.ArucoDetector(aruco_dict, aruco_params)
+
 class AnnotatedTrack(MediaStreamTrack):
     kind = "video"
-    def __init__(self, idx, fps=15):
+    def __init__(self, idx, fps=15, mode="pipeline"):
         super().__init__()
         self.idx = idx
         self.fps = fps
         self._start = None
         self._last_tick = -1
+        self.mode = mode
 
     async def recv(self):
         if self._start is None:
@@ -25,19 +33,32 @@ class AnnotatedTrack(MediaStreamTrack):
             self._pts = 0
         
         while True:
-            cur_tick = camera_manager.get_tick()
-            if cur_tick == self._last_tick:
-                await asyncio.sleep(0.005)
-                continue
+            if self.mode == "calibrate":
+                frame, ts = camera_manager.get_raw_frame(self.idx)
+                if frame is None:
+                    await asyncio.sleep(0.01)
+                    continue
                 
-            frame = camera_manager.get_annotated_frame(self.idx)
-            if frame is None:
-                await asyncio.sleep(0.005)
-                continue
+                # Detect markers for visualization
+                corners, ids, _ = aruco_detector.detectMarkers(frame)
+                if ids is not None:
+                    aruco.drawDetectedMarkers(frame, corners, ids)
+                
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            else:
+                cur_tick = camera_manager.get_tick()
+                if cur_tick == self._last_tick:
+                    await asyncio.sleep(0.005)
+                    continue
+                    
+                frame = camera_manager.get_annotated_frame(self.idx)
+                if frame is None:
+                    await asyncio.sleep(0.005)
+                    continue
+                
+                self._last_tick = cur_tick
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            self._last_tick = cur_tick
-            
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             video_frame = av.VideoFrame.from_ndarray(rgb, format='rgb24')
             self._pts += int(90000 / self.fps)
             video_frame.pts = self._pts
@@ -63,8 +84,10 @@ def start_webrtc_server():
             pcs.add(pc)
 
             cam_idx = int(request.query.get('cam', '1')) - 1
+            mode = request.query.get('mode', 'pipeline')
+            
             await pc.setRemoteDescription(offer)
-            track = AnnotatedTrack(cam_idx, fps=15)
+            track = AnnotatedTrack(cam_idx, fps=15, mode=mode)
             pc.addTrack(track)
 
             @pc.on('connectionstatechange')

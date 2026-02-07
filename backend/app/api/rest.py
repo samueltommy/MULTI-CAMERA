@@ -1,6 +1,7 @@
 from flask import Blueprint, jsonify, request, send_from_directory, render_template, current_app
 from app.services.fusion import fusion_service
 from app.services.pipeline import pipeline_service
+from app.services.calibration import calibration_service
 from app.core.config import settings
 import numpy as np
 import os
@@ -23,7 +24,8 @@ def trigger_status():
     return jsonify({
         'active': pipeline_service.session_active,
         'best_count': pipeline_service.best_session_result['count'],
-        'time_left': max(0, pipeline_service.session_end_time - time.time()) if pipeline_service.session_active else 0
+        'time_left': max(0, pipeline_service.session_end_time - time.time()) if pipeline_service.session_active else 0,
+        'has_homography': fusion_service.H is not None
     })
 
 @api.route('/ice')
@@ -44,6 +46,29 @@ def calibrate_page():
 @api.route('/gallery')
 def gallery_page():
     return render_template('gallery.html')
+
+@api.route('/calibrate/reset', methods=['POST'])
+def calibrate_reset():
+    calibration_service.reset()
+    return jsonify({'ok': True})
+
+@api.route('/calibrate/capture', methods=['POST'])
+def calibrate_capture():
+    success, msg = calibration_service.capture_points()
+    if success:
+        return jsonify({'ok': True, 'message': msg, 'count': len(calibration_service.src_pts)})
+    else:
+        return jsonify({'ok': False, 'error': msg}), 400
+
+@api.route('/calibrate/finish', methods=['POST'])
+def calibrate_finish():
+    data = request.get_json() or {}
+    name = data.get('name')
+    success, msg = calibration_service.compute_and_save(name=name)
+    if success:
+        return jsonify({'ok': True, 'message': msg})
+    else:
+        return jsonify({'ok': False, 'error': msg}), 400
 
 @api.route('/calibrate/compute', methods=['POST'])
 def calibrate_compute():
@@ -74,6 +99,47 @@ def calibrate_history():
     out = [c.to_dict() for c in history]
     db.close()
     return jsonify({'history': out})
+
+@api.route('/calibrate/auto', methods=['POST'])
+def calibrate_auto():
+    try:
+        from tools.auto_calibrate import auto_calibrate
+        required = int(request.json.get('points', os.environ.get('CALIBRATION_POINTS', 5)))
+        # We run this in a headless way if called from API to avoid window issues on server
+        success = auto_calibrate(required_points=required, headless=True)
+        if success:
+            fusion_service.load_homography()
+            return jsonify({'ok': True, 'message': 'Auto-calibration finished'})
+        else:
+            return jsonify({'error': 'Calibration failed or no markers found'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@api.route('/calibrate/activate/<int:cal_id>', methods=['POST'])
+def calibrate_activate(cal_id):
+    from app.database.session import SessionLocal
+    from app.database.models import Calibration
+    try:
+        db = SessionLocal()
+        # Deactivate all
+        db.query(Calibration).update({Calibration.is_active: False})
+        
+        # Activate specific
+        cal = db.query(Calibration).filter(Calibration.id == cal_id).first()
+        if not cal:
+            db.close()
+            return jsonify({'error': 'calibration not found'}), 404
+        
+        cal.is_active = True
+        db.commit()
+        db.close()
+        
+        # Reload in service
+        fusion_service.load_homography()
+        
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @api.route('/fused')
 def fused_list():

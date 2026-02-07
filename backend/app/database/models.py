@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime
+from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from datetime import datetime
 
@@ -48,7 +48,7 @@ class Calibration(Base):
     matrix_json = Column(String, nullable=False)
     
     # Metadata
-    is_active = Column(Integer, default=1) # 1 for active, 0 for archive
+    is_active = Column(Boolean, default=True) 
     notes = Column(String, nullable=True)
 
     def to_dict(self):
@@ -58,6 +58,6 @@ class Calibration(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "name": self.name,
             "matrix": json.loads(self.matrix_json),
-            "is_active": self.is_active == 1
+            "is_active": self.is_active
         }
 

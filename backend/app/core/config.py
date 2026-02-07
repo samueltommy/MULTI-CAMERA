@@ -51,9 +51,6 @@ class Config:
     if not RTSP_URL_2:
          raise ValueError("RTSP_URL_2 not set in .env")
 
-    # Homography
-    HOMOGRAPHY_PATH = os.environ.get('HOMOGRAPHY_PATH', '../homography_top_to_side.npy')
-
     # FFmpeg Relay
     START_FFMPEG_RELAY = os.environ.get('START_FFMPEG_RELAY', '0').lower() in ('1', 'true', 'yes')
     FFMPEG_FPS = int(os.environ.get('FFMPEG_FPS', str(TARGET_FPS)))
@@ -63,6 +60,9 @@ class Config:
     # WebRTC / ICE
     STUN_URL = os.environ.get('STUN_URL', 'stun:stun.l.google.com:19302')
     TURN_URL = os.environ.get('TURN_URL')
+
+    # Calibration
+    CALIBRATION_POINTS = int(os.environ.get('CALIBRATION_POINTS', '5'))
     TURN_USER = os.environ.get('TURN_USER', '')
     TURN_PASS = os.environ.get('TURN_PASS', '')
 

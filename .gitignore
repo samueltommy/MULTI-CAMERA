@@ -71,7 +71,6 @@ desktop.ini
 
 # Secrets / environment
 .env
-.env.*
 
 # Compiled Python files
 *.pyc

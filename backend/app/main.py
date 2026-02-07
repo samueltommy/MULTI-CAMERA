@@ -11,9 +11,6 @@ from app.database.session import engine
 from app.database.models import Base
 
 def create_app(start_services=True):
-    # Initialize DB tables
-    Base.metadata.create_all(bind=engine)
-
     # Template folder is at the project root: ../../templates
     template_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'templates'))
     app = Flask(__name__, template_folder=template_dir)

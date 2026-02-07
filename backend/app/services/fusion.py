@@ -16,44 +16,35 @@ class FusionService:
         self.fused_id_counter = 1
         
     def load_homography(self):
-        # Try loading from DB first
+        # Load from DB
         try:
             db = SessionLocal()
-            cal = db.query(Calibration).filter(Calibration.is_active == 1).order_by(Calibration.created_at.desc()).first()
+            cal = db.query(Calibration).filter(Calibration.is_active == True).order_by(Calibration.created_at.desc()).first()
             if cal:
                 self.H = np.array(json.loads(cal.matrix_json))
                 print(f"Loaded homography from DB (ID: {cal.id})")
                 db.close()
                 return
             db.close()
+            print("No active homography found in DB.")
         except Exception as e:
             print(f"Failed to load homography from DB: {e}")
-
-        # Fallback to file
-        try:
-           self.H = np.load(settings.HOMOGRAPHY_PATH)
-           print(f"Loaded homography fallback from {settings.HOMOGRAPHY_PATH}")
-        except Exception:
-            self.H = None
-            print("Homography not loaded.")
+        
+        self.H = None
 
     def set_homography(self, H, name="Manual Calibration"):
         self.H = H
-        # Update file fallback
-        try:
-            np.save(settings.HOMOGRAPHY_PATH, H)
-        except: pass
         
         # Save to DB
         try:
             db = SessionLocal()
-            # Deactivate old ones? (Optional but keeps history clean)
-            db.query(Calibration).update({Calibration.is_active: 0})
+            # Deactivate old ones
+            db.query(Calibration).update({Calibration.is_active: False})
             
             new_cal = Calibration(
                 name=name,
                 matrix_json=json.dumps(H.tolist()),
-                is_active=1
+                is_active=True
             )
             db.add(new_cal)
             db.commit()

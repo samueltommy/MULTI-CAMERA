@@ -23,6 +23,36 @@
     <h1>Real-time YOLO26 Segmentation (WebRTC)</h1>
 
     <div
+      id="calibrationWarning"
+      style="
+        display: none;
+        margin-bottom: 20px;
+        padding: 15px;
+        border: 2px solid #ff4444;
+        background: #ffe6e6;
+        color: #cc0000;
+        font-weight: bold;
+      "
+    >
+      System Uncalibrated! Homography matrix not found. Object fusion will not
+      work.
+      <button
+        onclick="location.href='/calibrate'"
+        style="
+          margin-left: 20px;
+          padding: 5px 15px;
+          background: #ff4444;
+          color: white;
+          border: none;
+          cursor: pointer;
+        "
+      >
+        Go to Calibration
+      </button>
+    </div>
+
+    <div
+      id="controlPanel"
       style="
         margin-bottom: 20px;
         padding: 10px;
@@ -130,6 +160,19 @@
             const r = await fetch("/trigger/status");
             if (r.ok) {
               const j = await r.json();
+
+              // Handle Homography/Calibration status
+              const warning = document.getElementById("calibrationWarning");
+              const controlPanel = document.getElementById("controlPanel");
+
+              if (!j.has_homography) {
+                warning.style.display = "block";
+                controlPanel.style.display = "none";
+              } else {
+                warning.style.display = "none";
+                controlPanel.style.display = "block";
+              }
+
               if (j.active) {
                 status.innerText = `Active! Time left: ${Math.round(j.time_left)}s | Best result so far: ${j.best_count} objects`;
                 btn.disabled = true;
@@ -141,7 +184,7 @@
                 } else {
                   status.innerText = "Idle";
                 }
-                btn.disabled = false;
+                btn.disabled = !j.has_homography;
                 pollingActive = false;
               }
             }
@@ -150,6 +193,10 @@
             pollingActive = false;
           }
         }
+
+        // Initial check
+        updateStatus();
+        setInterval(updateStatus, 5000); // Check homography status every 5s if idle
 
         btn.onclick = async () => {
           btn.disabled = true;
