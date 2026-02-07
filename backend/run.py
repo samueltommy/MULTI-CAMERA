@@ -62,7 +62,7 @@ if __name__ == '__main__':
     # Delay import of app components until migrations are complete
     from app.main import create_app, cleanup
     
-    # Register cleanup
+    # Register cleanup only in main process
     atexit.register(cleanup)
     
     app = create_app(start_services=True)

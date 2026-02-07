@@ -30,19 +30,24 @@ def create_app(start_services=True):
 
     return app
 
+_cleanup_done = False
 def cleanup():
+    global _cleanup_done
+    if _cleanup_done:
+        return
+    _cleanup_done = True
     print("Cleaning up...")
     pipeline_service.stop()
     for reader in camera_manager.readers:
         reader.stop()
-
-atexit.register(cleanup)
 
 if __name__ == '__main__':
     # Windows support for direct execution of main.py
     multiprocessing.freeze_support()
     
     app = create_app()
+    # Register cleanup only in main process
+    atexit.register(cleanup)
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
 else:
     # When imported by run.py or WSGI, just create the app object
