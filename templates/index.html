@@ -226,13 +226,6 @@
           startStreamsIfNeeded();
         };
 
-        // Add quick link to open the Livestream page
-        const openLivestream = document.createElement('button');
-        openLivestream.innerText = 'Open Livestream';
-        openLivestream.style = 'margin-left:20px; padding:8px 12px; cursor:pointer';
-        openLivestream.onclick = () => window.open('/livestream', '_blank');
-        document.getElementById('controlPanel').appendChild(openLivestream);
-
         // If a session was already active when the page loaded, ensure streams start
         (async () => {
           try {

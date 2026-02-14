@@ -59,11 +59,6 @@ def ice_config():
 def webrtc_page():
     return render_template('webrtc.html')
 
-
-@api.route('/livestream')
-def livestream_page():
-    return render_template('livestream.html')
-
 @api.route('/calibrate')
 def calibrate_page():
     return render_template('calibrate.html')
