@@ -21,9 +21,10 @@ def create_app(start_services=True):
         # 1. Cameras
         camera_manager.add_reader(settings.RTSP_URL_1, 0)
         camera_manager.add_reader(settings.RTSP_URL_2, 1)
-        # 2. NOTE: do NOT start Pipeline (Inference + Fusion) here by default.
-        #    Pipeline and its heavy inference worker will be started on-demand
-        #    when the user triggers a capture session via the `/trigger` endpoint.
+        # 2. Pipeline (always running to capture/display raw frames)
+        #    Inference will be enabled on-demand when the user clicks `/trigger`.
+        pipeline_service.start(inference_enabled=False)
+        print("[app] pipeline started with inference DISABLED (raw frames only)")
 
         # 3. WebRTC Server
         run_webrtc_thread()

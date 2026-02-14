@@ -17,15 +17,15 @@ def index():
 def trigger_session():
     import traceback
     duration = int(request.json.get('duration', 60))
-    # Start pipeline/inference worker on-demand if not already running
+    # Enable YOLO inference for this capture session
     try:
-        if not getattr(pipeline_service, 'running', False):
+        if not getattr(pipeline_service, 'inference_enabled', False):
             try:
-                pipeline_service.start()
+                pipeline_service.enable_inference(True)
                 pipeline_service.mark_started_on_demand(True)
-                print("[rest.trigger] pipeline_service started on-demand")
+                print("[rest.trigger] inference ENABLED for capture session")
             except Exception as e:
-                print(f"[rest.trigger] error during pipeline start: {e}")
+                print(f"[rest.trigger] error enabling inference: {e}")
                 traceback.print_exc()
     except Exception as e:
         print(f"[rest.trigger] outer exception: {e}")

@@ -11,9 +11,10 @@ from app.services.video_recorder import video_recorder
 
 class PipelineService:
     def __init__(self):
-        self.inference_manager = InferenceManager(settings)
+        self.inference_manager = None  # Created only when inference is enabled
         self.running = False
         self.thread = None
+        self.inference_enabled = False  # Tracks whether YOLO is active
         # If True, pipeline will shut itself down after a triggered session finishes
         self.started_on_demand = False
         self.raw_detections = [[], []]
@@ -35,7 +36,7 @@ class PipelineService:
         # Debug: remember last drawn detection count to surface changes
         self._last_draw_n = [0, 0]
         # Frame skip for inference (send every Nth frame to worker to reduce YOLO CPU load)
-        self._inference_skip_frames = getattr(settings, 'INFERENCE_SKIP_FRAMES', 5)
+        self._inference_skip_frames = getattr(settings, 'INFERENCE_SKIP_FRAMES', 1)
         self._frame_counter = [0, 0]  # Count frames per camera
 
     def start_session(self, duration=60):
@@ -57,8 +58,14 @@ class PipelineService:
         # Stop video recording
         video_recorder.stop_session()
 
-    def start(self):
-        self.inference_manager.start()
+    def start(self, inference_enabled=False):
+        """Start the pipeline loop.
+        
+        Args:
+            inference_enabled: If True, start YOLO inference immediately.
+                              If False, raw streams only (inference can be enabled later).
+        """
+        self.enable_inference(inference_enabled)
         self.running = True
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -67,10 +74,35 @@ class PipelineService:
         self.running = False
         if self.thread:
             self.thread.join()
-        self.inference_manager.stop()
+        # Stop inference if running
+        if self.inference_manager:
+            try:
+                self.inference_manager.stop()
+            except Exception:
+                pass
+        self.inference_manager = None
 
     def mark_started_on_demand(self, v=True):
         self.started_on_demand = bool(v)
+
+    def enable_inference(self, enable=True):
+        """Enable or disable YOLO inference dynamically."""
+        if enable and not self.inference_enabled:
+            # Start inference manager
+            if self.inference_manager is None:
+                self.inference_manager = InferenceManager(settings)
+            self.inference_manager.start()
+            self.inference_enabled = True
+            print("[pipeline] inference ENABLED")
+        elif not enable and self.inference_enabled:
+            # Stop inference manager
+            if self.inference_manager:
+                self.inference_manager.stop()
+            self.inference_enabled = False
+            # Reset detection state
+            self.raw_detections = [[], []]
+            self.raw_detection_ts = [0.0, 0.0]
+            print("[pipeline] inference DISABLED")
 
     def _draw_detections(self, frame, detections):
         """Helper to draw detections on a frame locally (high-visibility annotations)."""
@@ -146,25 +178,29 @@ class PipelineService:
                 tick_interval = 1.0 / target_fps
                 
                 # 3. Send to Inference (Skip frames to reduce load: send every Nth frame)
-                for cam_idx, frame in enumerate([f0, f1]):
-                    if frame is not None:
-                        self._frame_counter[cam_idx] += 1
-                        # Send frame if counter is multiple of skip value
-                        if self._frame_counter[cam_idx] % (self._inference_skip_frames + 1) == 0:
-                            self.inference_manager.send_frame(cam_idx, frame)
-                            print(f"[pipeline.infer] cam={cam_idx} sent frame #{self._frame_counter[cam_idx]} for inference")
-                        # Reset counter periodically to avoid overflow
-                        if self._frame_counter[cam_idx] > 100000:
-                            self._frame_counter[cam_idx] = 0
+                # Only send if inference is enabled
+                if self.inference_enabled and self.inference_manager:
+                    for cam_idx, frame in enumerate([f0, f1]):
+                        if frame is not None:
+                            self._frame_counter[cam_idx] += 1
+                            # Send frame if counter is multiple of skip value
+                            if self._frame_counter[cam_idx] % (self._inference_skip_frames + 1) == 0:
+                                self.inference_manager.send_frame(cam_idx, frame)
+                                print(f"[pipeline.infer] cam={cam_idx} sent frame #{self._frame_counter[cam_idx]} for inference")
+                            # Reset counter periodically to avoid overflow
+                            if self._frame_counter[cam_idx] > 100000:
+                                self._frame_counter[cam_idx] = 0
 
                 # 4. Process Results (Update cached detections)
                 # This retrieves inference results that have been processed by the worker
-                results = self.inference_manager.get_results()
+                # Only process if inference is enabled
+                if self.inference_enabled and self.inference_manager:
+                    results = self.inference_manager.get_results()
                 
                 # Log when results arrive for debugging
                 try:
                     if results:
-                        print(f"[pipeline.results] received {len(results)} result(s) at t={now:.2f}s")
+                        print(f"[pipeline.results] received {len(results)} result(s)")
                         for res in results:
                             cam = res.get('cam')
                             if 'detections' in res:
@@ -172,21 +208,35 @@ class PipelineService:
                 except Exception:
                     pass
 
+                # If we detected objects, start a short auto-save session so the annotated video is stored
+                try:
+                    if self.inference_enabled and results:
+                        for res in results:
+                            if 'detections' in res:
+                                dets = res.get('detections', [])
+                                if len(dets) > 0 and not self.session_active:
+                                    duration = getattr(settings, 'AUTO_SAVE_ON_DETECT_SECONDS', 10)
+                                    print(f"[pipeline] detection triggered auto-save session for {duration}s (cam={res.get('cam')} count={len(dets)})")
+                                    self.start_session(duration=duration)
+                except Exception:
+                    pass
+
                 # If available, the worker can provide its own annotated image via SHM
                 worker_annotated_frames = [None, None]
                 
-                for res in results:
-                    if 'error' in res: 
-                        print(f"Inference error: {res['error']}")
-                        continue
-                    if 'metric_infer_ms' in res: continue
+                if self.inference_enabled:
+                    for res in results:
+                        if 'error' in res: 
+                            print(f"Inference error: {res['error']}")
+                            continue
+                        if 'metric_infer_ms' in res: continue
+                            
+                        cam = res.get('cam')
+                        if cam is None: continue
                         
-                    cam = res.get('cam')
-                    if cam is None: continue
-                    
-                    # We only need the detections, we will draw them on the FRESH frame
-                    # This decouples inference FPS from Display FPS
-                    dets = res.get('detections', [])
+                        # We only need the detections, we will draw them on the FRESH frame
+                        # This decouples inference FPS from Display FPS
+                        dets = res.get('detections', [])
                     
                     # We need to scale detections back to original resolution?
                     # The worker receives a resized image (inference_width).
@@ -307,7 +357,6 @@ class PipelineService:
                 # 5. GENERATE ANNOTATED FRAMES (Smooth Rendering)
                 # Instead of using the worker's stale image, we draw the latest detections
                 # on the CURRENT fresh frame.
-                
                 annotated_frames = [None, None]
                 raw_frames = [f0, f1]
 
@@ -394,14 +443,13 @@ class PipelineService:
                         self.session_active = False
                         print(f"Session finished. Best count: {self.best_session_result['count']}")
                         video_recorder.stop_session()
-                        if self.started_on_demand:
+                        # Disable inference but keep pipeline running for raw streams
+                        if self.inference_enabled:
                             try:
-                                print("[pipeline] session finished; shutting down on-demand pipeline")
-                                self.inference_manager.stop()
+                                print("[pipeline] session finished; disabling inference")
+                                self.enable_inference(False)
                             except Exception:
                                 pass
-                            self.running = False
-                            break
                     else:
                         fused_count = len(current_fused)
                         if fused_count > self.best_session_result['count']:

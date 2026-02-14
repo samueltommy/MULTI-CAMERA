@@ -205,6 +205,9 @@
         // Initial check
         updateStatus();
         setInterval(updateStatus, 5000);
+        
+        // Always start WebRTC streams on page load (show raw video by default)
+        startStreamsIfNeeded();
 
         btn.onclick = async () => {
           btn.disabled = true;
