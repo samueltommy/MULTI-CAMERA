@@ -96,13 +96,16 @@ def worker_process_func(in_q, out_q, model_path, device_name, use_half, enable_m
                         'bottom_center': ((x1 + x2) / 2.0, float(y2))
                     })
 
-                # Log detection count every frame so user can confirm YOLO is active
+                # Log detection count occasionally (every 30 frames) to reduce noise
                 try:
-                    print(f"[inference.worker] cam={cam} detections={len(detections)} infer_ms={infer_ms:.1f}ms")
-                    if len(detections) > 0:
-                        # show up to first 4 detections (class,score,box)
-                        summary = ", ".join([f"cls={d['cls']} s={d['score']:.2f} b={d['box']}" for d in detections[:4]])
-                        print(f"[inference.worker] sample_dets: {summary}")
+                    if not hasattr(worker_process_func, '_frame_log_counter'):
+                        worker_process_func._frame_log_counter = 0
+                    worker_process_func._frame_log_counter += 1
+                    if worker_process_func._frame_log_counter % 30 == 0:
+                        print(f"[inference.worker] cam={cam} detections={len(detections)} infer_ms={infer_ms:.1f}ms")
+                        if len(detections) > 0:
+                            summary = ", ".join([f"cls={d['cls']} s={d['score']:.2f}" for d in detections[:4]])
+                            print(f"[inference.worker] sample: {summary}")
                 except Exception:
                     pass
                 
@@ -123,10 +126,8 @@ def worker_process_func(in_q, out_q, model_path, device_name, use_half, enable_m
                     dest[:h2, :w2, :] = annotated
                     # We pass 'shape' so pipeline knows valid area in output SHM
                     out_q.put({'cam': cam, 'shape': (h2, w2, 3), 'detections': detections, 'ts': time.time()})
-                    print(f"[inference.worker] queued result for cam={cam} with {len(detections)} detections")
                 else:
                     out_q.put({'cam': cam, 'detections': detections, 'ts': time.time()})
-                    print(f"[inference.worker] queued result for cam={cam} with {len(detections)} detections (no SHM)")
 
 
             except Exception as e:

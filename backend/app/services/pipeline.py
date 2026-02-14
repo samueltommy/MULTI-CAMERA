@@ -196,17 +196,8 @@ class PipelineService:
                 # Only process if inference is enabled
                 if self.inference_enabled and self.inference_manager:
                     results = self.inference_manager.get_results()
-                
-                # Log when results arrive for debugging
-                try:
-                    if results:
-                        print(f"[pipeline.results] received {len(results)} result(s)")
-                        for res in results:
-                            cam = res.get('cam')
-                            if 'detections' in res:
-                                print(f"[pipeline.results] -- cam={cam}: {len(res['detections'])} detections")
-                except Exception:
-                    pass
+                else:
+                    results = []
 
                 # If we detected objects, start a short auto-save session so the annotated video is stored
                 try:
@@ -237,58 +228,58 @@ class PipelineService:
                         # We only need the detections, we will draw them on the FRESH frame
                         # This decouples inference FPS from Display FPS
                         dets = res.get('detections', [])
-                    
-                    # We need to scale detections back to original resolution?
-                    # The worker receives a resized image (inference_width).
-                    # 'detections' from worker are relative to that small image.
-                    # We need to scale them to the CURRENT f0/f1 size.
-                    # But f0/f1 might have changed size? Assume stream size is constant.
-                    
-                    orig_frame = f0 if cam == 0 else f1
-                    if orig_frame is None: continue
-
-                    # Calculate scale
-                    # The worker was sent a frame resized to settings.INFERENCE_WIDTH
-                    # We can infer the scale from the 'shape' returned or just re-calculate based on config
-                    # But simpler: The worker returns detections.
-                    # We need to know the size of the image the worker PROCESSED.
-                    # The worker sends back 'shape'.
-                    
-                    shape = res.get('shape') # (h, w, 3) of the processed image
-                    if shape:
-                        ih, iw = shape[:2]
-                        oh, ow = orig_frame.shape[:2]
-                        sx, sy = (ow/iw, oh/ih)
                         
-                        scaled_dets = []
-                        for d in dets:
-                            sd = d.copy()
-                            b = d['box']
-                            sd['box'] = [int(b[0]*sx), int(b[1]*sy), int(b[2]*sx), int(b[3]*sy)]
-                            if d['center']: sd['center'] = (d['center'][0]*sx, d['center'][1]*sy)
-                            if d['bottom_center']: sd['bottom_center'] = (d['bottom_center'][0]*sx, d['bottom_center'][1]*sy)
-                            scaled_dets.append(sd)
+                        # We need to scale detections back to original resolution?
+                        # The worker receives a resized image (inference_width).
+                        # 'detections' from worker are relative to that small image.
+                        # We need to scale them to the CURRENT f0/f1 size.
+                        # But f0/f1 might have changed size? Assume stream size is constant.
+                        
+                        orig_frame = f0 if cam == 0 else f1
+                        if orig_frame is None: continue
 
-                        # Try to read the worker-produced annotated image (original YOLO rendering)
-                        try:
-                            if getattr(settings, 'USE_WORKER_ANNOTATED', False):
-                                wshape = res.get('shape')
-                                if wshape:
-                                    try:
-                                        worker_ann = self.inference_manager.resolve_shm_image(cam, wshape)
-                                        if worker_ann is not None:
-                                            # scale worker annotated image to match the original frame size
-                                            ah, aw = worker_ann.shape[:2]
-                                            oh, ow = orig_frame.shape[:2]
-                                            if (ah, aw) != (oh, ow):
-                                                worker_ann = cv2.resize(worker_ann, (ow, oh))
-                                            # store so pipeline can prefer it when rendering/recording
-                                            worker_annotated_frames[cam] = worker_ann
-                                            print(f"[pipeline] worker annotated available for cam={cam}")
-                                    except Exception:
-                                        pass
-                        except Exception:
-                            pass
+                        # Calculate scale
+                        # The worker was sent a frame resized to settings.INFERENCE_WIDTH
+                        # We can infer the scale from the 'shape' returned or just re-calculate based on config
+                        # But simpler: The worker returns detections.
+                        # We need to know the size of the image the worker PROCESSED.
+                        # The worker sends back 'shape'.
+                        
+                        shape = res.get('shape') # (h, w, 3) of the processed image
+                        if shape:
+                            ih, iw = shape[:2]
+                            oh, ow = orig_frame.shape[:2]
+                            sx, sy = (ow/iw, oh/ih)
+                            
+                            scaled_dets = []
+                            for d in dets:
+                                sd = d.copy()
+                                b = d['box']
+                                sd['box'] = [int(b[0]*sx), int(b[1]*sy), int(b[2]*sx), int(b[3]*sy)]
+                                if d['center']: sd['center'] = (d['center'][0]*sx, d['center'][1]*sy)
+                                if d['bottom_center']: sd['bottom_center'] = (d['bottom_center'][0]*sx, d['bottom_center'][1]*sy)
+                                scaled_dets.append(sd)
+
+                            # Try to read the worker-produced annotated image (original YOLO rendering)
+                            try:
+                                if getattr(settings, 'USE_WORKER_ANNOTATED', False):
+                                    wshape = res.get('shape')
+                                    if wshape:
+                                        try:
+                                            worker_ann = self.inference_manager.resolve_shm_image(cam, wshape)
+                                            if worker_ann is not None:
+                                                # scale worker annotated image to match the original frame size
+                                                ah, aw = worker_ann.shape[:2]
+                                                oh, ow = orig_frame.shape[:2]
+                                                if (ah, aw) != (oh, ow):
+                                                    worker_ann = cv2.resize(worker_ann, (ow, oh))
+                                                # store so pipeline can prefer it when rendering/recording
+                                                worker_annotated_frames[cam] = worker_ann
+                                                print(f"[pipeline] worker annotated available for cam={cam}")
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
 
                         # Hold previous non-empty detections for brief dropouts (temporal smoothing)
                         try:
