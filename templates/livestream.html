@@ -2,10 +2,10 @@
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>WebRTC Annotated Stream</title>
+    <title>Livestream</title>
   </head>
   <body>
-    <h3>Annotated WebRTC Stream</h3>
+    <h3>Live Camera Stream</h3>
     <video
       id="video"
       autoplay
@@ -19,6 +19,11 @@
         <option value="1">Camera 1</option>
         <option value="2">Camera 2</option>
       </select>
+      <label style="margin-left:10px">Mode: </label>
+      <select id="mode">
+        <option value="raw">Raw</option>
+        <option value="pipeline">Annotated (pipeline)</option>
+      </select>
       <button id="start">Start</button>
     </div>
 
@@ -28,10 +33,13 @@
 
       startBtn.onclick = async () => {
         const cam = document.getElementById("cam").value;
+        const mode = document.getElementById("mode").value;
         const pc = new RTCPeerConnection();
         pc.ontrack = (evt) => {
           videoEl.srcObject = evt.streams[0];
         };
+
+        pc.addTransceiver('video', { direction: 'recvonly' });
 
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);

@@ -10,6 +10,7 @@ from ultralytics import YOLO
 def worker_process_func(in_q, out_q, model_path, device_name, use_half, enable_masks, alpha, inference_width, shm_in_names_arg, shm_out_names_arg, shm_max_w_arg, shm_max_h_arg, conf_1, conf_2):
     try:
         dev = device_name
+        print(f"[inference.worker] starting worker on device={dev} model={model_path}")
         model = YOLO(model_path)
         conf_thresholds = [conf_1, conf_2]
         try:
@@ -22,6 +23,8 @@ def worker_process_func(in_q, out_q, model_path, device_name, use_half, enable_m
         # open shared memory segments by name
         try:
             in_shms = [shared_memory.SharedMemory(name=n) for n in shm_in_names_arg]
+            # out_shms are not strictly needed if we return detections + raw frame reconstruction, 
+            # but we keep them for the 'jpeg' fallback or if the worker does heavy drawing.
             out_shms = [shared_memory.SharedMemory(name=n) for n in shm_out_names_arg]
             max_w = shm_max_w_arg
             max_h = shm_max_h_arg
@@ -40,6 +43,7 @@ def worker_process_func(in_q, out_q, model_path, device_name, use_half, enable_m
                     continue
                 h, w, c = shape
                 buf = in_shms[cam].buf
+                # IMPORTANT: Read immediately to minimize race condition window
                 arr = np.ndarray((max_h, max_w, 3), dtype=np.uint8, buffer=buf)
                 small = arr[:h, :w, :].copy()
                 
@@ -47,34 +51,28 @@ def worker_process_func(in_q, out_q, model_path, device_name, use_half, enable_m
                     continue
 
                 t0 = time.time()
-                # Run inference
+                # Run simple, stateless inference on every frame (no tracker/persist)
                 try:
                     conf = conf_thresholds[cam] if cam < len(conf_thresholds) else 0.25
-                    is_yolo26 = "yolo26" in model_path.lower()
-                    
-                    if use_half and dev != 'cpu':
-                        results = model.track(small, device=dev, half=True, persist=True, 
-                                            tracker="bytetrack.yaml", verbose=False, conf=conf,
-                                            end2end=is_yolo26)
-                    else:
-                        results = model.track(small, device=dev, half=False, persist=True, 
-                                            tracker="bytetrack.yaml", verbose=False, conf=conf,
-                                            end2end=is_yolo26)
-                    infer_ms = (time.time() - t0) * 1000.0
-                    out_q.put({'metric_infer_ms': infer_ms})
-                except Exception:
-                    conf = conf_thresholds[cam] if cam < len(conf_thresholds) else 0.25
-                    is_yolo26 = "yolo26" in model_path.lower()
-                    results = model(small, device=dev, half=False, conf=conf, end2end=is_yolo26)
+                    use_half_local = (use_half and dev != 'cpu')
 
-                annotated = small.copy()
+                    # Plain model() call — more stable than track/persist for debugging
+                    results = model(small, device=dev, half=use_half_local, conf=conf)
+
+                    infer_ms = (time.time() - t0) * 1000.0
+                    # surface inference timing for visibility
+                    out_q.put({'metric_infer_ms': infer_ms})
+                except Exception as e:
+                    # If inference fails, report error but keep worker alive
+                    out_q.put({'error': f'inference failed: {e}'})
+                    continue
+
+                # We extract detections to send back to pipeline for smooth drawing
                 boxes, scores, class_ids, track_ids = [], [], [], []
                 
                 try:
                     res = results[0]
                     boxes = res.boxes.xyxy.cpu().numpy()
-                    if res.boxes.id is not None:
-                        track_ids = res.boxes.id.int().cpu().numpy()
                     scores = res.boxes.conf.cpu().numpy()
                     class_ids = res.boxes.cls.cpu().numpy()
                     if res.boxes.id is not None:
@@ -97,61 +95,45 @@ def worker_process_func(in_q, out_q, model_path, device_name, use_half, enable_m
                         'center': (cx, cy), 
                         'bottom_center': ((x1 + x2) / 2.0, float(y2))
                     })
-                
-                # Draw masks and boxes (simplified for brevity, similar to original)
-                if enable_masks and getattr(results[0], 'masks', None) is not None:
-                     # ... mask drawing logic ...
-                     # For brevity in this refactor, I will just copy the logic if essential or assume standard drawing
-                     # The user wants "perfectly the same". I should copy the mask drawing logic.
-                    masks = results[0].masks.xy
-                    palette = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255)]
-                    for i, mask in enumerate(masks):
-                        try:
-                            # Alpha blending for transparency
-                            color = palette[int(class_ids[i]) % len(palette)]
-                            mask_pts = (mask).astype(np.int32)
-                            
-                            # Create a mask image
-                            mask_img = np.zeros(annotated.shape[:2], dtype=np.uint8)
-                            cv2.fillPoly(mask_img, [mask_pts], 255)
-                            
-                            # Create colored overlay
-                            colored_overlay = np.zeros_like(annotated, dtype=np.uint8)
-                            colored_overlay[:] = color
-                            
-                            # Blend where the mask is present
-                            # alpha comes from args (defaults to 0.35 in config)
-                            # We only blend pixels inside the mask
-                            region = (mask_img == 255)
-                            annotated[region] = cv2.addWeighted(annotated[region], 1.0 - alpha, colored_overlay[region], alpha, 0)
-                            
-                            # Draw contour for better visibility
-                            cv2.polylines(annotated, [mask_pts], True, color, 1)
-                        except: pass
 
+                # Log detection count every frame so user can confirm YOLO is active
+                try:
+                    print(f"[inference.worker] cam={cam} detections={len(detections)} infer_ms={infer_ms:.1f}ms")
+                    if len(detections) > 0:
+                        # show up to first 4 detections (class,score,box)
+                        summary = ", ".join([f"cls={d['cls']} s={d['score']:.2f} b={d['box']}" for d in detections[:4]])
+                        print(f"[inference.worker] sample_dets: {summary}")
+                except Exception:
+                    pass
+                
+                # NOTE: We can still draw on 'annotated' and return it via SHM/JPEG
+                # but the pipeline will now prefer using 'detections' to draw on the fresh frame.
+                # We keep this strictly for debugging or if specific masks are needed.
+                annotated = small.copy()
                 for i, (box, score, cls) in enumerate(zip(boxes, scores, class_ids)):
                     x1, y1, x2, y2 = [int(v) for v in box]
                     cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     cv2.putText(annotated, f"{int(cls)}", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
 
-                # Write output
+                # Write output (Optional, since pipeline will redraw)
                 out_buf = out_shms[cam].buf
                 h2, w2 = annotated.shape[:2]
                 if h2 <= max_h and w2 <= max_w:
                     dest = np.ndarray((max_h, max_w, 3), dtype=np.uint8, buffer=out_buf)
                     dest[:h2, :w2, :] = annotated
+                    # We pass 'shape' so pipeline knows valid area in output SHM
                     out_q.put({'cam': cam, 'shape': (h2, w2, 3), 'detections': detections, 'ts': time.time()})
+                    print(f"[inference.worker] queued result for cam={cam} with {len(detections)} detections")
                 else:
-                    ok, buf = cv2.imencode('.jpg', annotated)
-                    if ok:
-                        out_q.put({'cam': cam, 'jpeg': buf.tobytes(), 'detections': detections, 'ts': time.time()})
+                    out_q.put({'cam': cam, 'detections': detections, 'ts': time.time()})
+                    print(f"[inference.worker] queued result for cam={cam} with {len(detections)} detections (no SHM)")
+
 
             except Exception as e:
                 out_q.put({'error': f'worker processing exception: {e}'})
 
     except Exception as e:
         out_q.put({'error': f'worker init failed: {e}'})
-
 
 class InferenceManager:
     def __init__(self, config):
@@ -164,8 +146,24 @@ class InferenceManager:
         self.shms = [] 
         self.shm_max_w = config.INFERENCE_WIDTH
         self.shm_max_h = max(16, int(config.INFERENCE_WIDTH * 0.75))
+        # Track whether a frame for each camera is currently in-flight in the worker.
+        # This prevents overwriting the per-camera SHM buffer while the worker
+        # is still processing that camera's message.
+        self._inflight = [False, False]
+        # Timestamp when an in-flight message was queued (for simple staleness checks)
+        self._inflight_ts = [0.0, 0.0]
 
     def start(self):
+        # Clean up any stale SHM handles left from a previous run
+        try:
+            for s in list(self.shms):
+                try:
+                    s.close(); s.unlink()
+                except Exception:
+                    pass
+        finally:
+            self.shms = []
+
         # Create shared memory
         try:
             for i in range(2):
@@ -178,25 +176,42 @@ class InferenceManager:
         except Exception as e:
             print("Error creating SHM:", e)
 
-        self.worker_in_q = multiprocessing.Queue(maxsize=8)
+        # Reduced maxsize to prevent queue buildup that causes SHM overwrite race conditions
+        self.worker_in_q = multiprocessing.Queue(maxsize=2)
         self.worker_out_q = multiprocessing.Queue(maxsize=16)
 
+        # reset inflight trackers
+        self._inflight = [False, False]
+        self._inflight_ts = [0.0, 0.0]
+
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+        # Prefer a plain .pt model in the repository (fresh reset) if available.
+        # This keeps the public InferenceManager API unchanged while ensuring
+        # the worker runs the requested `yolo26s-seg.pt` model by default.
+        from pathlib import Path
+        repo_root = Path(__file__).resolve().parents[3]
+        pt_candidate = repo_root / "models" / "yolo26s-seg.pt"
+        model_path_to_use = str(pt_candidate) if pt_candidate.exists() else self.config.MODEL_PATH
+        if pt_candidate.exists():
+            print(f"[inference] using PT model override: {model_path_to_use}")
+        else:
+            print(f"[inference] using configured model path: {model_path_to_use}")
 
         self.worker_proc = multiprocessing.Process(
             target=worker_process_func,
             args=(
-                self.worker_in_q, 
-                self.worker_out_q, 
-                self.config.MODEL_PATH, 
-                device, 
-                self.config.USE_HALF, 
-                self.config.ENABLE_MASKS, 
-                self.config.ALPHA, 
-                self.config.INFERENCE_WIDTH, 
-                self.shm_in_names, 
-                self.shm_out_names, 
-                self.shm_max_w, 
+                self.worker_in_q,
+                self.worker_out_q,
+                model_path_to_use,
+                device,
+                self.config.USE_HALF,
+                self.config.ENABLE_MASKS,
+                self.config.ALPHA,
+                self.config.INFERENCE_WIDTH,
+                self.shm_in_names,
+                self.shm_out_names,
+                self.shm_max_w,
                 self.shm_max_h,
                 self.config.CONF_THRESHOLD_1,
                 self.config.CONF_THRESHOLD_2
@@ -204,29 +219,77 @@ class InferenceManager:
             daemon=True
         )
         self.worker_proc.start()
-        print(f"Inference worker started pid={self.worker_proc.pid}")
+        print(f"Inference worker started pid={self.worker_proc.pid} (model={model_path_to_use})")
 
     def stop(self):
-        if self.worker_in_q:
-            self.worker_in_q.put(None)
-        if self.worker_proc:
-            self.worker_proc.terminate()
-        for s in self.shms:
-            try:
-                s.close()
-                s.unlink()
-            except: pass
+        # Signal worker to exit gracefully, then force-terminate if still alive.
+        try:
+            if self.worker_in_q:
+                try:
+                    self.worker_in_q.put_nowait(None)
+                except Exception:
+                    pass
+            if self.worker_proc:
+                try:
+                    # give worker a short chance to exit
+                    self.worker_proc.join(timeout=0.5)
+                except Exception:
+                    pass
+                try:
+                    if self.worker_proc.is_alive():
+                        self.worker_proc.terminate()
+                        self.worker_proc.join(timeout=0.5)
+                except Exception:
+                    pass
+        finally:
+            self.worker_proc = None
+            self.worker_in_q = None
+            self.worker_out_q = None
+
+        # Close and unlink any shared memory segments and reset trackers
+        try:
+            for s in list(self.shms):
+                try:
+                    s.close()
+                    s.unlink()
+                except Exception:
+                    pass
+        finally:
+            self.shms = []
+            self.shm_in_names = [None, None]
+            self.shm_out_names = [None, None]
+            self._inflight = [False, False]
+            self._inflight_ts = [0.0, 0.0]
 
     def send_frame(self, cam_idx, frame):
-        # Resize and put in Shm
         if frame is None: return
-        
+
+        # If worker not running, try to restart it so frames don't silently stop being processed
+        if not self.worker_proc or not getattr(self.worker_proc, 'is_alive', lambda: False)():
+            print("[inference] worker not alive — restarting from send_frame")
+            try:
+                self.start()
+            except Exception as e:
+                print(f"[inference] failed to restart worker: {e}")
+                return
+
+        # Prevent overwriting the same camera SHM while that camera's frame is still being processed
+        if self._inflight[cam_idx]:
+            # stale inflight -> try to clear if too old
+            import time as _t
+            if self._inflight_ts[cam_idx] and (_t.time() - self._inflight_ts[cam_idx]) > 5.0:
+                print(f"[inference] inflight for cam={cam_idx} stale, clearing")
+                self._inflight[cam_idx] = False
+                self._inflight_ts[cam_idx] = 0.0
+            else:
+                return
+
         h, w = frame.shape[:2]
         small = frame
         if w > self.shm_max_w:
              scale = self.shm_max_w / w
              small = cv2.resize(frame, (0,0), fx=scale, fy=scale)
-        
+
         # ensure fits
         sh, sw = small.shape[:2]
         if sh > self.shm_max_h or sw > self.shm_max_w:
@@ -237,9 +300,16 @@ class InferenceManager:
              shm = self.shms[cam_idx * 2]
              dest = np.ndarray((self.shm_max_h, self.shm_max_w, 3), dtype=np.uint8, buffer=shm.buf)
              dest[:small.shape[0], :small.shape[1], :] = small
+             
+             # Try put. If full, ignore.
              try:
                 self.worker_in_q.put_nowait({'cam': cam_idx, 'shape': small.shape})
-             except: pass
+                # mark this camera as in-flight until a worker result for this cam is received
+                import time as _time
+                self._inflight[cam_idx] = True
+                self._inflight_ts[cam_idx] = _time.time()
+             except Exception:
+                pass # Queue full, drop frame safely
         except Exception as e:
             print("Error sending frame to worker:", e)
 
@@ -249,8 +319,16 @@ class InferenceManager:
         while True:
             try:
                 res = self.worker_out_q.get_nowait()
+                # If worker returned a result for a camera, mark that camera as no longer in-flight
+                try:
+                    cam = res.get('cam')
+                    if cam is not None and 0 <= cam < len(self._inflight):
+                        self._inflight[cam] = False
+                        self._inflight_ts[cam] = 0.0
+                except Exception:
+                    pass
                 results.append(res)
-            except:
+            except Exception:
                 break
         return results
 

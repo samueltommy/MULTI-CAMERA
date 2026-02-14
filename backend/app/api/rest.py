@@ -15,8 +15,28 @@ def index():
 
 @api.route('/trigger', methods=['POST'])
 def trigger_session():
+    import traceback
     duration = int(request.json.get('duration', 60))
-    pipeline_service.start_session(duration)
+    # Start pipeline/inference worker on-demand if not already running
+    try:
+        if not getattr(pipeline_service, 'running', False):
+            try:
+                pipeline_service.start()
+                pipeline_service.mark_started_on_demand(True)
+                print("[rest.trigger] pipeline_service started on-demand")
+            except Exception as e:
+                print(f"[rest.trigger] error during pipeline start: {e}")
+                traceback.print_exc()
+    except Exception as e:
+        print(f"[rest.trigger] outer exception: {e}")
+        traceback.print_exc()
+
+    try:
+        pipeline_service.start_session(duration)
+    except Exception as e:
+        print(f"[rest.trigger] error during session start: {e}")
+        traceback.print_exc()
+    
     return jsonify({'status': 'started', 'duration': duration})
 
 @api.route('/trigger/status')
@@ -38,6 +58,11 @@ def ice_config():
 @api.route('/webrtc')
 def webrtc_page():
     return render_template('webrtc.html')
+
+
+@api.route('/livestream')
+def livestream_page():
+    return render_template('livestream.html')
 
 @api.route('/calibrate')
 def calibrate_page():

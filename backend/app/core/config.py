@@ -38,6 +38,23 @@ class Config:
     MOTION_THRESHOLD = float(os.environ.get('MOTION_THRESHOLD', '0.02'))
     MOTION_HIGH_FPS = int(os.environ.get('MOTION_HIGH_FPS', '8'))
     MOTION_LOW_FPS = int(os.environ.get('MOTION_LOW_FPS', '1'))
+
+    # Auto-save when detection occurs (seconds)
+    AUTO_SAVE_ON_DETECT_SECONDS = int(os.environ.get('AUTO_SAVE_ON_DETECT_SECONDS', '10'))
+
+    # Debug: save frames when detections unexpectedly drop to zero
+    DEBUG_SAVE_ZERO_DET = os.environ.get('DEBUG_SAVE_ZERO_DET', '1').lower() in ('1','true','yes')
+    DEBUG_SAVE_ZERO_DET_THRESHOLD = int(os.environ.get('DEBUG_SAVE_ZERO_DET_THRESHOLD', '3'))
+
+    # Hold previous detections for short dropouts (seconds)
+    DETECTION_HOLD_SECONDS = float(os.environ.get('DETECTION_HOLD_SECONDS', '1.0'))
+
+    # Skip frames for inference (worker processes every Nth frame to save CPU)
+    # E.g., INFERENCE_SKIP_FRAMES=1 means process every 2nd frame (~7.5 FPS on 15 FPS display)
+    # Set to 0 to process every frame.
+    INFERENCE_SKIP_FRAMES = int(os.environ.get('INFERENCE_SKIP_FRAMES', '1'))  # Process every 2nd frame
+    # When true, pipeline will prefer the worker's annotated frame (the original YOLO output)
+    USE_WORKER_ANNOTATED = os.environ.get('USE_WORKER_ANNOTATED', '0').lower() in ('1','true','yes')
     
     # Sync
     SYNC_TOL_MS = int(os.environ.get('SYNC_TOL_MS', '500'))

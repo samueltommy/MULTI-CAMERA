@@ -95,6 +95,7 @@ snapshots/
 # Local uploads / media
 uploads/
 media/
+videos/
 
 # Flask/instance
 instance/

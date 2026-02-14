@@ -93,7 +93,7 @@
     </div>
 
     <script>
-      async function startWebRTC(cam, videoEl) {
+      async function startWebRTC(cam, videoEl, mode = 'pipeline') {
         // fetch ICE config from server (supports TURN if configured)
         let iceServers = [{ urls: "stun:stun.l.google.com:19302" }];
         try {
@@ -119,7 +119,7 @@
         await pc.setLocalDescription(offer);
 
         const resp = await fetch(
-          `http://${location.hostname}:8080/offer?cam=${cam}`,
+          `http://${location.hostname}:8080/offer?cam=${cam}&mode=${mode}`,
           {
             method: "POST",
             body: JSON.stringify({ sdp: offer.sdp, type: offer.type }),
@@ -130,14 +130,22 @@
         await pc.setRemoteDescription(new RTCSessionDescription(ans));
       }
 
-      // Auto-start both streams on load, with simple retry on failure
+      // Simplified: the detection/capture page does not auto-start WebRTC streams.
+      // Users should open the dedicated livestream page for raw/annotated live video.
       window.addEventListener("DOMContentLoaded", () => {
         const v1 = document.getElementById("video1");
         const v2 = document.getElementById("video2");
-        const tryStart = async (cam, videoEl, attempts = 3) => {
+        const btn = document.getElementById("triggerBtn");
+        const status = document.getElementById("triggerStatus");
+
+        let pollingActive = false;
+        let streamsStarted = false;
+
+        const tryStart = async (cam, videoEl, attempts = 3, mode = 'pipeline') => {
           for (let i = 0; i < attempts; i++) {
             try {
-              await startWebRTC(cam, videoEl);
+              // explicitly request pipeline annotated mode from server
+              await startWebRTC(cam, videoEl, mode);
               console.log("WebRTC started for cam", cam);
               return;
             } catch (err) {
@@ -147,13 +155,13 @@
           }
           console.error("Giving up starting cam", cam);
         };
-        tryStart(1, v1);
-        tryStart(2, v2);
-        // Trigger logic
-        const btn = document.getElementById("triggerBtn");
-        const status = document.getElementById("triggerStatus");
 
-        let pollingActive = false;
+        async function startStreamsIfNeeded() {
+          if (streamsStarted) return;
+          streamsStarted = true;
+          tryStart(1, v1, 3, 'pipeline');
+          tryStart(2, v2, 3, 'pipeline');
+        }
 
         async function updateStatus() {
           try {
@@ -161,7 +169,6 @@
             if (r.ok) {
               const j = await r.json();
 
-              // Handle Homography/Calibration status
               const warning = document.getElementById("calibrationWarning");
               const controlPanel = document.getElementById("controlPanel");
 
@@ -176,7 +183,8 @@
               if (j.active) {
                 status.innerText = `Active! Time left: ${Math.round(j.time_left)}s | Best result so far: ${j.best_count} objects`;
                 btn.disabled = true;
-                // Continue polling while active
+                // If a capture session is active, show annotated streams
+                startStreamsIfNeeded();
                 setTimeout(updateStatus, 1000);
               } else {
                 if (j.best_count > 0) {
@@ -196,7 +204,7 @@
 
         // Initial check
         updateStatus();
-        setInterval(updateStatus, 5000); // Check homography status every 5s if idle
+        setInterval(updateStatus, 5000);
 
         btn.onclick = async () => {
           btn.disabled = true;
@@ -210,23 +218,30 @@
             pollingActive = true;
             updateStatus();
           }
+
+          // Start annotated WebRTC streams on button click
+          startStreamsIfNeeded();
         };
 
-        // Check once on load, and start polling ONLY if already active (e.g. after refresh)
+        // Add quick link to open the Livestream page
+        const openLivestream = document.createElement('button');
+        openLivestream.innerText = 'Open Livestream';
+        openLivestream.style = 'margin-left:20px; padding:8px 12px; cursor:pointer';
+        openLivestream.onclick = () => window.open('/livestream', '_blank');
+        document.getElementById('controlPanel').appendChild(openLivestream);
+
+        // If a session was already active when the page loaded, ensure streams start
         (async () => {
-          const r = await fetch("/trigger/status");
-          if (r.ok) {
-            const j = await r.json();
-            if (j.active) {
-              pollingActive = true;
-              updateStatus();
-            } else {
-              if (j.best_count > 0) {
-                status.innerText = `Idle (Last best result: ${j.best_count} objects)`;
-              } else {
-                status.innerText = "Idle";
+          try {
+            const r = await fetch('/trigger/status');
+            if (r.ok) {
+              const j = await r.json();
+              if (j.active) {
+                startStreamsIfNeeded();
               }
             }
+          } catch (e) {
+            console.warn('Failed initial session check', e);
           }
         })();
       });
