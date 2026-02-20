@@ -1,4 +1,5 @@
 import os
+from flask_cors import CORS
 import atexit
 import multiprocessing
 from flask import Flask
@@ -14,6 +15,7 @@ def create_app(start_services=True):
     # Template folder is at the project root: ../../templates
     template_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'templates'))
     app = Flask(__name__, template_folder=template_dir)
+    CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
     app.register_blueprint(rest.api)
 
     if start_services:
