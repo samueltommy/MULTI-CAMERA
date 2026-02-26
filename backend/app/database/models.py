@@ -24,6 +24,9 @@ class FusedObject(Base):
     class_id = Column(Integer, nullable=True)
     score = Column(Float, nullable=True)
 
+    estimated_weight = Column(Float, nullable=True)
+    is_fused = Column(Boolean, default=False) # True = Volume method, False = Area method
+
     def to_dict(self):
         return {
             "id": self.id,
@@ -31,6 +34,8 @@ class FusedObject(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "snapshot_top": self.snapshot_top,
             "snapshot_side": self.snapshot_side,
+            "estimated_weight": self.estimated_weight,
+            "is_fused": self.is_fused,
             "position": {
                 "top": [self.top_center_x, self.top_center_y],
                 "side": [self.side_center_x, self.side_center_y]

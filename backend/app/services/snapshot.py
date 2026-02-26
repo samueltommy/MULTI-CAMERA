@@ -15,45 +15,36 @@ class SnapshotService:
     def _save_file(self, path, img):
         cv2.imwrite(path, img)
 
-    def save_fusion_snapshot(self, fused_track, frame_top, frame_side):
-        # fused_track is the dict from FusionService
-        if fused_track.get('has_snapshot'):
+    def save_fusion_snapshot(self, track_obj, frame_top, frame_side=None):
+        if track_obj.get('has_snapshot'):
             return
-
-        # Check in DB to be sure (optional, but good for consistency)
-        # But for performance we rely on the runtime flag 'has_snapshot'
         
-        runtime_id = fused_track['id']
-        
-        # Prepare crops
-        top_crop = self._crop(frame_top, fused_track['top']['box'])
-        side_crop = self._crop(frame_side, fused_track['side']['box'])
-
-        if top_crop is None and side_crop is None:
-            return
-
+        runtime_id = track_obj['id']
         ts = int(time.time())
-        top_path_rel = f"id{runtime_id}_top_{ts}.jpg"
-        side_path_rel = f"id{runtime_id}_side_{ts}.jpg"
         
-        top_path_abs = os.path.join(settings.SNAPSHOT_DIR, top_path_rel)
-        side_path_abs = os.path.join(settings.SNAPSHOT_DIR, side_path_rel)
-
+        # 1. Handle Top Camera (Always exists)
+        top_crop = self._crop(frame_top, track_obj['top']['box']) if track_obj.get('top') else None
+        top_path_rel = f"id{runtime_id}_top_{ts}.jpg" if top_crop is not None else None
+        
         if top_crop is not None:
+            top_path_abs = os.path.join(settings.SNAPSHOT_DIR, top_path_rel)
             self.executor.submit(self._save_file, top_path_abs, top_crop)
-        else:
-            top_path_rel = None
-            
-        if side_crop is not None:
-            self.executor.submit(self._save_file, side_path_abs, side_crop)
-        else:
-            side_path_rel = None
 
-        # Update DB
-        self.executor.submit(self._update_db, runtime_id, top_path_rel, side_path_rel, fused_track)
+        # 2. Handle Side Camera (Might be None if not fused)
+        side_crop = None
+        side_path_rel = None
+        if track_obj.get('is_fused') and track_obj.get('side') and frame_side is not None:
+            side_crop = self._crop(frame_side, track_obj['side']['box'])
+            if side_crop is not None:
+                side_path_rel = f"id{runtime_id}_side_{ts}.jpg"
+                side_path_abs = os.path.join(settings.SNAPSHOT_DIR, side_path_rel)
+                self.executor.submit(self._save_file, side_path_abs, side_crop)
+
+        # 3. Update Database
+        self.executor.submit(self._update_db, runtime_id, top_path_rel, side_path_rel, track_obj)
         
-        fused_track['has_snapshot'] = True
-        fused_track['snapshot_paths'] = (top_path_rel, side_path_rel)
+        track_obj['has_snapshot'] = True
+        track_obj['snapshot_paths'] = (top_path_rel, side_path_rel)
 
     def _crop(self, frame, box):
         if frame is None or not box: return None
@@ -68,7 +59,6 @@ class SnapshotService:
     def _update_db(self, runtime_id, top_path, side_path, track_data):
         db = SessionLocal()
         try:
-            # Check if exists
             obj = db.query(FusedObject).filter(FusedObject.track_id == runtime_id).first()
             if not obj:
                 obj = FusedObject(track_id=runtime_id)
@@ -77,15 +67,18 @@ class SnapshotService:
             obj.snapshot_top = top_path
             obj.snapshot_side = side_path
             
-            # Save metadata from the moment of snapshot
-            top_c = track_data['top'].get('center')
-            side_c = track_data['side'].get('bottom_center')
-            if top_c:
-                obj.top_center_x = top_c[0]
-                obj.top_center_y = top_c[1]
-            if side_c:
-                obj.side_center_x = side_c[0]
-                obj.side_center_y = side_c[1]
+            # Save Metadata
+            if track_data.get('top') and track_data['top'].get('center'):
+                obj.top_center_x = track_data['top']['center'][0]
+                obj.top_center_y = track_data['top']['center'][1]
+                
+            if track_data.get('side') and track_data['side'].get('bottom_center'):
+                obj.side_center_x = track_data['side']['bottom_center'][0]
+                obj.side_center_y = track_data['side']['bottom_center'][1]
+
+            # Save Weight and Fusion Status
+            obj.estimated_weight = track_data.get('estimated_weight')
+            obj.is_fused = track_data.get('is_fused', False)
                 
             db.commit()
         except Exception as e:
