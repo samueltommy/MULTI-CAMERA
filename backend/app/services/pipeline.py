@@ -389,16 +389,82 @@ class PipelineService:
                         except Exception:
                             pass
                 
-                # 6. Fusion (Using cached detections)
+                # 6. Fusion & WEIGHT PREDICTION (Fused & Unfused)
                 current_fused = []
+                fused_top_centers = [] # Untuk melacak mana yang sudah diproses 3D
+                
+                from app.services.weight_predictor import weight_predictor
+                from app.services.snapshot import snapshot_service
+                
+                # A. LAKUKAN FUSION (Mendapatkan pasangan kamera 1 & 2)
                 if self.raw_detections[0] and self.raw_detections[1] and fusion_service.H is not None:
-                    # Check if detections are fresh enough? (Optional)
-                    # For now we fuse whatever we have
                     current_fused = fusion_service.process_frame(
                         self.raw_detections[0], self.raw_detections[1],
                         self.raw_detection_ts[0], self.raw_detection_ts[1],
                         f0, f1
                     )
+                
+                frame_shape = f0.shape if f0 is not None else None
+
+                # B. PROSES AYAM YANG TER-FUSION (Algoritma 3D Volume)
+                for fo in current_fused:
+                    top_box = fo['top'].get('box')
+                    side_box = fo['side'].get('box')
+                    top_center = fo['top'].get('center')
+                    
+                    weight = weight_predictor.predict_from_volume(top_box, side_box, 'chicken', frame_shape)
+                    
+                    if weight >= 0: # -1 berarti dia masuk Obstacle Zone (Abaikan)
+                        track_obj = {
+                            'id': fo['fid'], # Gunakan ID dari Fusion Tracker
+                            'top': fo['top'],
+                            'side': fo['side'],
+                            'is_fused': True,
+                            'estimated_weight': weight,
+                            'has_snapshot': False
+                        }
+                        # Simpan ke DB dengan gambar Top & Side
+                        snapshot_service.save_fusion_snapshot(track_obj, f0, f1)
+                        fo['top']['weight'] = weight # Tempel untuk digambar di video
+                        
+                    if top_center:
+                        fused_top_centers.append(top_center)
+
+                # C. PROSES SISA AYAM YANG TIDAK FUSION (Algoritma 2D Area persis kode lama)
+                if self.raw_detections[0]:
+                    if not hasattr(self, 'unfused_id_counter'):
+                        self.unfused_id_counter = 10000 # Beri ID terpisah untuk membedakan
+                        
+                    for det_top in self.raw_detections[0]:
+                        top_center = det_top.get('center')
+                        
+                        # Cek apakah centroid ayam ini sudah diproses di tahap 3D (Fusion)
+                        is_already_fused = False
+                        for fc in fused_top_centers:
+                            # Toleransi 5 pixel untuk berjaga-jaga
+                            if fc and top_center and abs(fc[0]-top_center[0]) < 5 and abs(fc[1]-top_center[1]) < 5:
+                                is_already_fused = True
+                                break
+                                
+                        if not is_already_fused:
+                            top_box = det_top.get('box')
+                            
+                            # Jalankan Algoritma 2D murni seperti yolo_multiclass_weight.py
+                            weight = weight_predictor.predict_from_area(top_box, 'chicken', frame_shape)
+                            
+                            if weight >= 0: # Jika tidak di obstacle zone
+                                self.unfused_id_counter += 1
+                                track_obj = {
+                                    'id': self.unfused_id_counter, 
+                                    'top': det_top,
+                                    'side': None,
+                                    'is_fused': False, # Tandai bahwa ini murni dari 1 Kamera
+                                    'estimated_weight': weight,
+                                    'has_snapshot': False
+                                }
+                                # Simpan ke DB HANYA dengan gambar Top (frame_side = None)
+                                snapshot_service.save_fusion_snapshot(track_obj, f0, None)
+                                det_top['weight'] = weight
 
                 # 7. Draw Fusion Markers & Update Camera Manager
                 for i in range(2):

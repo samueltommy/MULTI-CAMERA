@@ -186,7 +186,7 @@ class FusionService:
                 attached['side'] = side
             
             # Snapshot logic
-            snapshot_service.save_fusion_snapshot(attached, frame0, frame1)
+            # snapshot_service.save_fusion_snapshot(attached, frame0, frame1)
 
             current_fused_objects.append({
                 'fid': attached['id'],
