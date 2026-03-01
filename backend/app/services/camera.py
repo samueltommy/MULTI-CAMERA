@@ -1,6 +1,7 @@
 import cv2
 import threading
 import time
+import os
 from typing import List, Optional
 
 class RTSPReader:
@@ -30,6 +31,23 @@ class RTSPReader:
     def _run(self):
         print(f"RTSP reader starting for {self.url}")
         cap = cv2.VideoCapture(self.url)
+
+        # --- TAMBAHAN: Cek apakah input adalah file video atau stream ---
+        # Ini membantu kita menentukan strategi looping
+        is_file = False
+        frame_delay = 0.033
+
+        if isinstance(self.url, str) and not self.url.startswith(('rtsp:', 'http:', 'https:', 'udp:')):
+            if os.path.exists(self.url):
+                is_file = True
+                print(f"[{self.index}] Detected file input, enabling loop mode.")
+                
+                # AMBIL FPS ASLI VIDEO UNTUK MENGATUR KECEPATAN
+                video_fps = cap.get(cv2.CAP_PROP_FPS)
+                if video_fps > 0:
+                    frame_delay = 1.0 / video_fps
+                    print(f"[{self.index}] File FPS: {video_fps}, Delay: {frame_delay:.4f}s")
+
         if not cap.isOpened():
             print(f"Failed to open {self.url} in reader")
         else:
@@ -45,12 +63,26 @@ class RTSPReader:
                 time.sleep(1.0)
                 continue
             
+            # --- TAMBAHAN PENTING: SLEEP SESUAI FPS ---
+            # Jika ini file, kita harus menunggu agar kecepatannya normal
+            if is_file:
+                time.sleep(frame_delay)
+            # ------------------------------------------
+
             ret, frame = cap.read()
+            
             if not ret:
-                cap.release()
-                time.sleep(0.5)
-                cap = cv2.VideoCapture(self.url)
-                continue
+                if is_file:
+                    # Looping video
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    continue
+                else:
+                    # Reconnect stream
+                    print(f"[{self.index}] Stream disconnect, reconnecting...")
+                    cap.release()
+                    time.sleep(0.5)
+                    cap = cv2.VideoCapture(self.url)
+                    continue
             
             with self.lock:
                 self.frame = frame

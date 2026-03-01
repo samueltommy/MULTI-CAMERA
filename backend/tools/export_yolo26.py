@@ -3,7 +3,7 @@ import os
 
 def export_model():
     # This script assumes you have placed 'yolo26s-seg.pt' in the models/ directory
-    model_name = "yolo26s-seg"
+    model_name = "yolo26-ayam"
     pt_path = os.path.join("..", "models", f"{model_name}.pt")
     
     if not os.path.exists(pt_path):

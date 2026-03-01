@@ -96,6 +96,7 @@ snapshots/
 uploads/
 media/
 videos/
+data/
 
 # Flask/instance
 instance/

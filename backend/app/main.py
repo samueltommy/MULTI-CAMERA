@@ -23,7 +23,7 @@ def create_app(start_services=True):
         camera_manager.add_reader(settings.RTSP_URL_2, 1)
         # 2. Pipeline (always running to capture/display raw frames)
         #    Inference will be enabled on-demand when the user clicks `/trigger`.
-        pipeline_service.start(inference_enabled=False)
+        pipeline_service.start(inference_enabled=True)
         print("[app] pipeline started with inference DISABLED (raw frames only)")
 
         # 3. WebRTC Server
