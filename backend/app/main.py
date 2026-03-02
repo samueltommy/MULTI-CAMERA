@@ -1,4 +1,5 @@
 import os
+from flask_cors import CORS
 import atexit
 import multiprocessing
 from flask import Flask
@@ -14,6 +15,7 @@ def create_app(start_services=True):
     # Template folder is at the project root: ../../templates
     template_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'templates'))
     app = Flask(__name__, template_folder=template_dir)
+    CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
     app.register_blueprint(rest.api)
 
     if start_services:
@@ -21,9 +23,20 @@ def create_app(start_services=True):
         # 1. Cameras
         camera_manager.add_reader(settings.RTSP_URL_1, 0)
         camera_manager.add_reader(settings.RTSP_URL_2, 1)
+
+        # if the two streams are exactly the same URL (e.g. the same video file),
+        # we can shortcut calibration by using the identity homography.  this
+        # makes the fusion code treat objects as "clones" with zero reproj error.
+        if settings.RTSP_URL_1 == settings.RTSP_URL_2:
+            from app.services.fusion import fusion_service
+            import numpy as np
+            H = np.eye(3, dtype=np.float32)
+            fusion_service.set_homography(H, name="Auto identity (same source)")
+            print("[app] identical camera URLs detected, applied identity homography")
+
         # 2. Pipeline (always running to capture/display raw frames)
         #    Inference will be enabled on-demand when the user clicks `/trigger`.
-        pipeline_service.start(inference_enabled=True)
+        pipeline_service.start(inference_enabled=False)
         print("[app] pipeline started with inference DISABLED (raw frames only)")
 
         # 3. WebRTC Server

@@ -27,6 +27,8 @@ class PipelineService:
             'frames': [None, None],
             'timestamp': 0.0
         }
+        self.weight_history = {}  # Map: obj_id -> smoothed_weight
+        self.alpha = 0.15
         # Debug counters for unexpected zero-detections
         self._consecutive_zero = [0, 0]
         self._last_nonzero_ts = [0.0, 0.0]
@@ -117,29 +119,28 @@ class PipelineService:
             if not box:
                 continue
             x1, y1, x2, y2 = [int(v) for v in box]
-            score = d.get('score', 0.0)
-            cls_id = d.get('cls', '?')
+            
+            # AMBIL DATA ID DAN BERAT
+            # track_id dari worker, weight ditempel saat proses fusion/2D di pipeline
+            obj_id = d.get('track_id', '?')
+            weight = d.get('weight', 0.0) 
 
-            # Box (thicker for visibility)
+            # Box (Warna Hijau)
             color = (0, 220, 0)
             cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness)
 
-            # Label with filled background for contrast
-            label = f"{cls_id}:{score:.2f}"
+            # MODIFIKASI LABEL: Hanya ID dan Berat (Tanpa Confidence Score)
+            label = f"ID:{obj_id} | {weight:.3f}kg"
+            
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
             pad = 6
             lx1, ly1 = x1, max(0, y1 - th - pad)
             lx2, ly2 = x1 + tw + pad, y1
+            
+            # Background Label
             cv2.rectangle(out, (lx1, ly1), (lx2, ly2), color, -1)
+            # Text Label
             cv2.putText(out, label, (lx1 + 3, ly2 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
-
-        # Header when detections exist so it's obvious in saved videos
-        try:
-            if detections:
-                header = f"YOLO detections: {len(detections)}"
-                cv2.putText(out, header, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2, cv2.LINE_AA)
-        except Exception:
-            pass
 
         return out
 
@@ -408,24 +409,30 @@ class PipelineService:
 
                 # B. PROSES AYAM YANG TER-FUSION (Algoritma 3D Volume)
                 for fo in current_fused:
+                    obj_id = fo['top'].get('track_id', '?') # Gunakan track_id dari ByteTrack
                     top_box = fo['top'].get('box')
                     side_box = fo['side'].get('box')
-                    top_center = fo['top'].get('center')
+                    top_center = fo['top'].get('center') # <--- Definisi variabel di sini
+                    obj_id = fo['top'].get('track_id', '?')
                     
                     weight = weight_predictor.predict_from_volume(top_box, side_box, 'chicken', frame_shape)
                     
-                    if weight >= 0: # -1 berarti dia masuk Obstacle Zone (Abaikan)
+                    if weight >= 0:
+                        # Terapkan Smoothing (EMA)
+                        prev_weight = self.weight_history.get(obj_id, weight)
+                        smoothed_weight = (self.alpha * weight) + (1 - self.alpha) * prev_weight
+                        self.weight_history[obj_id] = smoothed_weight
+                        
                         track_obj = {
-                            'id': fo['fid'], # Gunakan ID dari Fusion Tracker
+                            'id': obj_id,
                             'top': fo['top'],
                             'side': fo['side'],
                             'is_fused': True,
-                            'estimated_weight': weight,
+                            'estimated_weight': smoothed_weight,
                             'has_snapshot': False
                         }
-                        # Simpan ke DB dengan gambar Top & Side
                         snapshot_service.save_fusion_snapshot(track_obj, f0, f1)
-                        fo['top']['weight'] = weight # Tempel untuk digambar di video
+                        fo['top']['weight'] = smoothed_weight
                         
                     if top_center:
                         fused_top_centers.append(top_center)
@@ -436,6 +443,7 @@ class PipelineService:
                         self.unfused_id_counter = 10000 # Beri ID terpisah untuk membedakan
                         
                     for det_top in self.raw_detections[0]:
+                        obj_id = det_top.get('track_id', '?')
                         top_center = det_top.get('center')
                         
                         # Cek apakah centroid ayam ini sudah diproses di tahap 3D (Fusion)
@@ -453,13 +461,15 @@ class PipelineService:
                             weight = weight_predictor.predict_from_area(top_box, 'chicken', frame_shape)
                             
                             if weight >= 0: # Jika tidak di obstacle zone
-                                self.unfused_id_counter += 1
+                                prev_weight = self.weight_history.get(obj_id, weight)
+                                smoothed_weight = (self.alpha * weight) + (1 - self.alpha) * prev_weight
+                                self.weight_history[obj_id] = smoothed_weight
                                 track_obj = {
                                     'id': self.unfused_id_counter, 
                                     'top': det_top,
                                     'side': None,
                                     'is_fused': False, # Tandai bahwa ini murni dari 1 Kamera
-                                    'estimated_weight': weight,
+                                    'estimated_weight': smoothed_weight,
                                     'has_snapshot': False
                                 }
                                 # Simpan ke DB HANYA dengan gambar Top (frame_side = None)
@@ -524,6 +534,12 @@ class PipelineService:
                     video_recorder.write_frame(1, f1, annotated_frames[1])
 
                 camera_manager.increment_tick()
+
+                if self.inference_enabled and self._frame_counter[0] % 100 == 0:
+                    # Hapus riwayat berat untuk ID yang sudah tidak terlihat di kedua kamera
+                    active_ids = {d.get('track_id') for d in self.raw_detections[0]} | \
+                                {d.get('track_id') for d in self.raw_detections[1]}
+                    self.weight_history = {tid: w for tid, w in self.weight_history.items() if tid in active_ids}
                 
                 elapsed = time.time() - t0
                 to_sleep = max(0.0, tick_interval - elapsed)

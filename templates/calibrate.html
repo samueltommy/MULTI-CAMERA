@@ -92,6 +92,9 @@
       <button id="finish-btn" style="background-color: #4caf50; color: white">
         Save Calibration
       </button>
+      <button id="identity-btn" style="background-color: #008CBA; color: white">
+        Use Identity
+      </button>
       <a href="/" class="back-btn">Back to Dashboard</a>
       <div id="status-msg">Ready</div>
     </div>
@@ -210,6 +213,25 @@
             statusMsg.style.color = "red";
           }
         });
+
+      document.getElementById("identity-btn").addEventListener("click", async () => {
+        statusMsg.textContent = "Applying identity...";
+        try {
+          const r = await fetch("/calibrate/identity", { method: "POST" });
+          const j = await r.json();
+          if (j.ok) {
+            statusMsg.textContent = "Identity homography set.";
+            statusMsg.style.color = "green";
+            loadHistory();
+          } else {
+            statusMsg.textContent = "Error: " + j.error;
+            statusMsg.style.color = "red";
+          }
+        } catch (e) {
+          statusMsg.textContent = "Server error during identity";
+          statusMsg.style.color = "red";
+        }
+      });
 
       loadHistory();
     </script>

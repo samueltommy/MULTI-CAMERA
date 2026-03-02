@@ -110,6 +110,24 @@ def calibrate_compute():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+
+@api.route('/calibrate/identity', methods=['POST'])
+def calibrate_identity():
+    """Explicitly set an identity homography.
+
+    This is useful when the two camera feeds are actually the same video
+    (e.g. you are testing with a duplicated source).  With an identity
+    matrix every point projects to itself and the fusion logic treats the
+    two streams as perfectly overlapping.  The endpoint simply writes the
+    3x3 identity into the database via :class:`FusionService`.
+    """
+    try:
+        H = np.eye(3, dtype=np.float32)
+        fusion_service.set_homography(H, name="Identity (same video)")
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @api.route('/calibrate/history')
 def calibrate_history():
     from app.database.session import SessionLocal
