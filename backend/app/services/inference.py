@@ -11,20 +11,22 @@ def worker_process_func(in_q, out_q, model_path, device_name, use_half, enable_m
     try:
         dev = device_name
         print(f"[inference.worker] starting worker on device={dev} model={model_path}")
-        model = YOLO(model_path)
+        
+        # 1. Muat 2 model terpisah agar state tracking Cam 0 & Cam 1 tidak bentrok
+        models = [YOLO(model_path), YOLO(model_path)]
         conf_thresholds = [conf_1, conf_2]
+        
         try:
-            model.to(dev)
-            if dev != 'cpu' and use_half:
-                 model.model.half()
+            for m in models:
+                m.to(dev)
+                if dev != 'cpu' and use_half:
+                     m.model.half()
         except Exception:
             pass
 
         # open shared memory segments by name
         try:
             in_shms = [shared_memory.SharedMemory(name=n) for n in shm_in_names_arg]
-            # out_shms are not strictly needed if we return detections + raw frame reconstruction, 
-            # but we keep them for the 'jpeg' fallback or if the worker does heavy drawing.
             out_shms = [shared_memory.SharedMemory(name=n) for n in shm_out_names_arg]
             max_w = shm_max_w_arg
             max_h = shm_max_h_arg
@@ -51,19 +53,24 @@ def worker_process_func(in_q, out_q, model_path, device_name, use_half, enable_m
                     continue
 
                 t0 = time.time()
-                # Run simple, stateless inference on every frame (no tracker/persist)
                 try:
                     conf = conf_thresholds[cam] if cam < len(conf_thresholds) else 0.25
                     use_half_local = (use_half and dev != 'cpu')
 
-                    # Plain model() call — more stable than track/persist for debugging
-                    results = model(small, device=dev, half=use_half_local, conf=conf)
+                    # 2. Gunakan .track() dengan persist=True pada model spesifik kamera tersebut
+                    results = models[cam].track(
+                        small, 
+                        device=dev, 
+                        half=use_half_local, 
+                        conf=conf, 
+                        persist=True,      # Wajib True agar ID diingat antar frame
+                        tracker="bytetrack.yaml", 
+                        verbose=False
+                    )
 
                     infer_ms = (time.time() - t0) * 1000.0
-                    # surface inference timing for visibility
                     out_q.put({'metric_infer_ms': infer_ms})
                 except Exception as e:
-                    # If inference fails, report error but keep worker alive
                     out_q.put({'error': f'inference failed: {e}'})
                     continue
 
@@ -75,6 +82,8 @@ def worker_process_func(in_q, out_q, model_path, device_name, use_half, enable_m
                     boxes = res.boxes.xyxy.cpu().numpy()
                     scores = res.boxes.conf.cpu().numpy()
                     class_ids = res.boxes.cls.cpu().numpy()
+                    
+                    # 3. Ambil ID dari hasil tracking
                     if res.boxes.id is not None:
                          track_ids = res.boxes.id.int().cpu().numpy()
                     else:
@@ -91,44 +100,53 @@ def worker_process_func(in_q, out_q, model_path, device_name, use_half, enable_m
                         'box': [x1, y1, x2, y2], 
                         'score': float(score), 
                         'cls': int(cls), 
-                        'track_id': int(tid),
+                        'track_id': int(tid), 
                         'center': (cx, cy), 
                         'bottom_center': ((x1 + x2) / 2.0, float(y2))
                     })
 
-                # Log detection count occasionally (every 30 frames) to reduce noise
+                # --- PERBAIKAN: DEFINISIKAN ANNOTATED ---
+                # Kita perlu membuat gambar 'annotated' agar bisa dikirim ukurannya (shape) ke pipeline
+                # dan juga untuk tampilan debug di Shared Memory.
+                annotated = small.copy()
+                
+                # (Opsional) Gambar kotak pada annotated untuk debug view via SHM
+                # Pipeline utama akan menggambar ulang sendiri, tapi ini berguna jika kita melihat raw stream worker
+                for i, (box, score, cls, tid) in enumerate(zip(boxes, scores, class_ids, track_ids)):
+                    x1, y1, x2, y2 = [int(v) for v in box]
+                    # Kotak hijau tipis untuk debug
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 1)
+                    label = f"{int(tid)}" if tid != -1 else f"{int(cls)}"
+                    cv2.putText(annotated, label, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                # ----------------------------------------
+
+                # Log detection count occasionally
                 try:
                     if not hasattr(worker_process_func, '_frame_log_counter'):
                         worker_process_func._frame_log_counter = 0
                     worker_process_func._frame_log_counter += 1
                     if worker_process_func._frame_log_counter % 30 == 0:
                         print(f"[inference.worker] cam={cam} detections={len(detections)} infer_ms={infer_ms:.1f}ms")
-                        if len(detections) > 0:
-                            summary = ", ".join([f"cls={d['cls']} s={d['score']:.2f}" for d in detections[:4]])
-                            print(f"[inference.worker] sample: {summary}")
                 except Exception:
                     pass
                 
-                # NOTE: We can still draw on 'annotated' and return it via SHM/JPEG
-                # but the pipeline will now prefer using 'detections' to draw on the fresh frame.
-                # We keep this strictly for debugging or if specific masks are needed.
-                annotated = small.copy()
-                for i, (box, score, cls) in enumerate(zip(boxes, scores, class_ids)):
-                    x1, y1, x2, y2 = [int(v) for v in box]
-                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(annotated, f"{int(cls)}", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+                # Write output to SHM (Debug View)
+                try:
+                    out_buf = out_shms[cam].buf
+                    h2, w2 = annotated.shape[:2]
+                    if h2 <= max_h and w2 <= max_w:
+                        dest = np.ndarray((max_h, max_w, 3), dtype=np.uint8, buffer=out_buf)
+                        dest[:h2, :w2, :] = annotated
+                except Exception:
+                    pass 
 
-                # Write output (Optional, since pipeline will redraw)
-                out_buf = out_shms[cam].buf
-                h2, w2 = annotated.shape[:2]
-                if h2 <= max_h and w2 <= max_w:
-                    dest = np.ndarray((max_h, max_w, 3), dtype=np.uint8, buffer=out_buf)
-                    dest[:h2, :w2, :] = annotated
-                    # We pass 'shape' so pipeline knows valid area in output SHM
-                    out_q.put({'cam': cam, 'shape': (h2, w2, 3), 'detections': detections, 'ts': time.time()})
-                else:
-                    out_q.put({'cam': cam, 'detections': detections, 'ts': time.time()})
-
+                # Kirim hasil ke Pipeline (Shape wajib ada agar pipeline bisa scaling koordinat)
+                out_q.put({
+                    'cam': cam, 
+                    'shape': annotated.shape[:3], # (h, w, c) - Variabel annotated sekarang sudah ada
+                    'detections': detections, 
+                    'ts': time.time()
+                })
 
             except Exception as e:
                 out_q.put({'error': f'worker processing exception: {e}'})
