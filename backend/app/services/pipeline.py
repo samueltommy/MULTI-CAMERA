@@ -21,17 +21,17 @@ class PipelineService:
         self.raw_detection_ts = [0.0, 0.0]
         self.session_active = False
         self.session_end_time = 0.0
+        # Variabel baru untuk menyimpan ID sesi saat ini (folder name)
+        self.current_session_id = None 
+        
         self.best_session_result = {
             'count': 0, 'detections': [[], []], 'frames': [None, None], 'timestamp': 0.0
         }
         
-        # --- SMART STABILITY VARIABLES ---
-        # self.object_stats menyimpan: { track_id: { 'centers': deque, 'stable_weight': float } }
         self.object_stats = {} 
-        self.alpha = 0.05           # EMA Factor (Kecil = Stabil)
-        self.move_threshold = 5.0   # Batas gerak (pixel). Jika > 5px, dianggap bergerak.
-        self.jump_threshold = 0.30  # Batas lonjakan (%). Jika berubah > 30%, dianggap outlier.
-        # ---------------------------------
+        self.alpha = 0.05
+        self.move_threshold = 5.0
+        self.jump_threshold = 0.30
 
         self._consecutive_zero = [0, 0]
         self._last_nonzero_ts = [0.0, 0.0]
@@ -40,74 +40,58 @@ class PipelineService:
         self._frame_counter = [0, 0]
 
     def _get_smart_weight(self, obj_id, current_center, raw_weight):
-        """
-        Menghitung berat dengan filter Gerakan (Static Check) dan Filter Outlier.
-        """
-        # Inisialisasi jika ID baru
+        # (Logika smart weight sama seperti sebelumnya, tidak berubah)
         if obj_id not in self.object_stats:
             self.object_stats[obj_id] = {
-                'centers': deque(maxlen=5), # Simpan 5 posisi terakhir
+                'centers': deque(maxlen=5),
                 'stable_weight': 0.0
             }
-        
         stats = self.object_stats[obj_id]
-        
-        # 1. Update Posisi
         if current_center:
             stats['centers'].append(current_center)
-        
         last_stable = stats['stable_weight']
-        
-        # Jika raw_weight 0 atau sangat kecil (glitch), abaikan langsung (Hold value)
         if raw_weight < 0.05:
             return last_stable
-
-        # 2. Cek Gerakan (Movement Filter)
-        # Hitung rata-rata perpindahan dalam history posisi
         is_moving = False
         if len(stats['centers']) >= 2:
-            # Ambil jarak dari posisi sekarang ke posisi sebelumnya
             curr = stats['centers'][-1]
             prev = stats['centers'][-2]
             dist = ((curr[0]-prev[0])**2 + (curr[1]-prev[1])**2)**0.5
             if dist > self.move_threshold:
                 is_moving = True
-        
-        # Jika bergerak, JANGAN update berat (Hold value terakhir agar stabil)
         if is_moving and last_stable > 0:
             return last_stable
-
-        # 3. Cek Outlier (Jump Filter)
-        # Jika berat tiba-tiba melonjak drastis (misal posisi berubah aneh), abaikan
         if last_stable > 0:
             diff_pct = abs(raw_weight - last_stable) / last_stable
             if diff_pct > self.jump_threshold:
-                # Lonjakan > 30% dianggap aneh, abaikan (Hold value)
                 return last_stable
-
-        # 4. Update EMA (Hanya jika Static & Valid)
         if last_stable == 0.0:
             new_weight = raw_weight
         else:
             new_weight = (self.alpha * raw_weight) + ((1 - self.alpha) * last_stable)
-        
         stats['stable_weight'] = new_weight
         return new_weight
 
     def start_session(self, duration=60):
         print(f"Starting triggered session for {duration} seconds")
+        # 1. Generate Session ID (Folder Name) berdasarkan waktu sekarang
+        self.current_session_id = time.strftime('%Y%m%d_%H%M%S')
+        
         self.best_session_result = {
             'count': 0, 'detections': [[], []], 'frames': [None, None], 'timestamp': 0.0
         }
         self.session_end_time = time.time() + duration
         self.session_active = True
+        # Start video recording
         video_recorder.start_session(fps=settings.MOTION_HIGH_FPS)
 
     def stop_session(self):
         self.session_active = False
+        # self.current_session_id = None # Opsional: reset atau biarkan
         print("Session force stopped")
         video_recorder.stop_session()
 
+    # ... (Method start, stop, mark_started_on_demand, enable_inference, _draw_detections SAMA SEPERTI SEBELUMNYA) ...
     def start(self, inference_enabled=False):
         self.enable_inference(inference_enabled)
         self.running = True
@@ -145,24 +129,19 @@ class PipelineService:
         out = frame.copy()
         h, w = out.shape[:2]
         thickness = max(2, int(min(w, h) / 200))
-
         for d in detections:
             box = d.get('box')
             if not box: continue
             x1, y1, x2, y2 = [int(v) for v in box]
-            
             obj_id = d.get('track_id', '?')
             weight = d.get('weight', 0.0) 
-
             color = (0, 220, 0)
             cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness)
-
             label = f"ID:{obj_id} | {weight:.3f}kg"
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
             pad = 6
             lx1, ly1 = x1, max(0, y1 - th - pad)
             lx2, ly2 = x1 + tw + pad, y1
-            
             cv2.rectangle(out, (lx1, ly1), (lx2, ly2), color, -1)
             cv2.putText(out, label, (lx1 + 3, ly2 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
         return out
@@ -174,6 +153,7 @@ class PipelineService:
         while self.running:
             try:
                 t0 = time.time()
+                # 1. Get Frames
                 f0, ts0 = camera_manager.get_raw_frame(0)
                 f1, ts1 = camera_manager.get_raw_frame(1)
                 
@@ -181,7 +161,7 @@ class PipelineService:
                     time.sleep(0.01)
                     continue
 
-                # Motion Detection
+                # 2. Motion Detection
                 motion_present = False
                 for idx, frame in enumerate([f0, f1]):
                     if frame is None: continue
@@ -198,7 +178,7 @@ class PipelineService:
                 target_fps = settings.MOTION_HIGH_FPS if (motion_present or self.session_active) else settings.MOTION_LOW_FPS
                 tick_interval = 1.0 / target_fps
                 
-                # Inference Sending
+                # 3. Inference Sending
                 if self.inference_enabled and self.inference_manager:
                     for cam_idx, frame in enumerate([f0, f1]):
                         if frame is not None:
@@ -209,7 +189,7 @@ class PipelineService:
                             if self._frame_counter[cam_idx] > 100000:
                                 self._frame_counter[cam_idx] = 0
 
-                # Inference Results
+                # 4. Process Results
                 if self.inference_enabled and self.inference_manager:
                     results = self.inference_manager.get_results()
                 else:
@@ -228,7 +208,7 @@ class PipelineService:
                 except Exception:
                     pass
 
-                # Process Worker Results
+                # Handle Inference Results (Scaling, Hold logic, etc.)
                 worker_annotated_frames = [None, None]
                 if self.inference_enabled:
                     for res in results:
@@ -236,22 +216,18 @@ class PipelineService:
                             print(f"Inference error: {res['error']}")
                             continue
                         if 'metric_infer_ms' in res: continue
-                            
                         cam = res.get('cam')
                         if cam is None: continue
-                        
                         dets = res.get('detections', [])
                         orig_frame = f0 if cam == 0 else f1
                         if orig_frame is None: continue
 
                         shape = res.get('shape') 
                         scaled_dets = []
-                        
                         if shape:
                             ih, iw = shape[:2]
                             oh, ow = orig_frame.shape[:2]
                             sx, sy = (ow/iw, oh/ih)
-                            
                             for d in dets:
                                 sd = d.copy()
                                 b = d['box']
@@ -259,7 +235,6 @@ class PipelineService:
                                 if d['center']: sd['center'] = (d['center'][0]*sx, d['center'][1]*sy)
                                 if d['bottom_center']: sd['bottom_center'] = (d['bottom_center'][0]*sx, d['bottom_center'][1]*sy)
                                 scaled_dets.append(sd)
-
                             try:
                                 if getattr(settings, 'USE_WORKER_ANNOTATED', False):
                                     wshape = res.get('shape')
@@ -287,7 +262,6 @@ class PipelineService:
 
                         self.raw_detections[cam] = scaled_dets
                         self.raw_detection_ts[cam] = res.get('ts', 0)
-
                         try:
                             if len(scaled_dets) == 0:
                                 self._consecutive_zero[cam] += 1
@@ -299,7 +273,7 @@ class PipelineService:
                             pass
 
                 # ==============================================================================
-                # 6. Fusion & WEIGHT PREDICTION (SMART LOGIC)
+                # 6. Fusion & WEIGHT PREDICTION (SMART LOGIC & SESSION ID)
                 # ==============================================================================
                 current_fused = []
                 fused_top_centers = [] 
@@ -325,10 +299,7 @@ class PipelineService:
                     top_center = fo['top'].get('center')
                     
                     raw_weight = weight_predictor.predict_from_volume(top_box, side_box, 'chicken', frame_shape)
-                    
-                    # --- GUNAKAN SMART WEIGHT FUNCTION ---
                     final_weight = self._get_smart_weight(obj_id, top_center, raw_weight)
-                    # -------------------------------------
 
                     if final_weight >= 0:
                         track_obj = {
@@ -339,7 +310,8 @@ class PipelineService:
                             'estimated_weight': final_weight,
                             'has_snapshot': False
                         }
-                        snapshot_service.save_fusion_snapshot(track_obj, f0, f1)
+                        # KIRIM SESSION ID DISINI
+                        snapshot_service.save_fusion_snapshot(track_obj, f0, f1, session_id=self.current_session_id)
                         
                         fo['top']['weight'] = final_weight
                         if fo.get('side'):
@@ -367,10 +339,7 @@ class PipelineService:
                         if not is_already_fused:
                             top_box = det_top.get('box')
                             raw_weight = weight_predictor.predict_from_area(top_box, 'chicken', frame_shape)
-                            
-                            # --- GUNAKAN SMART WEIGHT FUNCTION ---
                             final_weight = self._get_smart_weight(obj_id, top_center, raw_weight)
-                            # -------------------------------------
                             
                             if final_weight >= 0:
                                 track_obj = {
@@ -381,7 +350,8 @@ class PipelineService:
                                     'estimated_weight': final_weight,
                                     'has_snapshot': False
                                 }
-                                snapshot_service.save_fusion_snapshot(track_obj, f0, None)
+                                # KIRIM SESSION ID DISINI
+                                snapshot_service.save_fusion_snapshot(track_obj, f0, None, session_id=self.current_session_id)
                                 det_top['weight'] = final_weight
 
                 # ==============================================================================
@@ -450,7 +420,6 @@ class PipelineService:
                                 'timestamp': time.time(),
                                 'fused': current_fused
                             }
-                    
                     video_recorder.write_frame(0, f0, annotated_frames[0])
                     video_recorder.write_frame(1, f1, annotated_frames[1])
 

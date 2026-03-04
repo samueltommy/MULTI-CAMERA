@@ -8,7 +8,8 @@ class FusedObject(Base):
     __tablename__ = 'fused_objects'
 
     id = Column(Integer, primary_key=True, index=True)
-    track_id = Column(Integer, unique=True, index=True) # The ID assigned by the tracker logic
+    track_id = Column(Integer, index=True) # The ID assigned by the tracker logic
+    session_id = Column(String, index=True, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     
     # Snapshot paths
@@ -30,6 +31,7 @@ class FusedObject(Base):
     def to_dict(self):
         return {
             "id": self.id,
+            "session_id": self.session_id,
             "track_id": self.track_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "snapshot_top": self.snapshot_top,

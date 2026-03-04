@@ -35,15 +35,27 @@ class FusionService:
     def set_homography(self, H, name="Manual Calibration"):
         self.H = H
         
-        # Save to DB
         try:
             db = SessionLocal()
-            # Deactivate old ones
+            
+            # 1. Siapkan string JSON untuk perbandingan
+            new_matrix_str = json.dumps(H.tolist())
+            
+            # 2. Cek kalibrasi aktif terakhir
+            last_active = db.query(Calibration).filter(Calibration.is_active == True).order_by(Calibration.created_at.desc()).first()
+            
+            # 3. Jika matriks SAMA PERSIS dengan yang aktif, JANGAN simpan baru
+            if last_active and last_active.matrix_json == new_matrix_str:
+                print(f"Homography identical to active one (ID: {last_active.id}). Skipping DB save.")
+                db.close()
+                return # KELUAR, tidak melakukan insert
+
+            # 4. Jika BEDA, nonaktifkan yang lama dan simpan yang baru
             db.query(Calibration).update({Calibration.is_active: False})
             
             new_cal = Calibration(
                 name=name,
-                matrix_json=json.dumps(H.tolist()),
+                matrix_json=new_matrix_str, # Gunakan string yang sudah digenerate
                 is_active=True
             )
             db.add(new_cal)

@@ -14,42 +14,67 @@ class SnapshotService:
         os.makedirs(settings.SNAPSHOT_DIR, exist_ok=True)
 
     def _save_file(self, path, img):
-        cv2.imwrite(path, img)
+        try:
+            cv2.imwrite(path, img)
+        except Exception as e:
+            print(f"Error saving snapshot: {e}")
 
-    def save_fusion_snapshot(self, track_obj, frame_top, frame_side=None):
+    def save_fusion_snapshot(self, track_obj, frame_top, frame_side=None, session_id=None):
         if track_obj.get('has_snapshot'):
             return
         
         runtime_id = track_obj['id']
         ts = int(time.time())
         
-        # 1. NEW: Create a dedicated subfolder for this ID
-        id_folder_rel = f"id_{runtime_id}"
-        id_folder_abs = os.path.join(settings.SNAPSHOT_DIR, id_folder_rel)
-        os.makedirs(id_folder_abs, exist_ok=True) #
-        
-        # 2. Handle Top Camera
+        # --- STRUKTUR FOLDER BARU ---
+        # Format: snapshots / SESSION_ID / id_100 / top_...jpg
+        if session_id:
+            # Jika ada session_id, buat folder sesi
+            base_folder = os.path.join(settings.SNAPSHOT_DIR, session_id, f"id_{runtime_id}")
+        else:
+            # Fallback jika tidak ada sesi (misal debug), langsung folder ID
+            base_folder = os.path.join(settings.SNAPSHOT_DIR, f"id_{runtime_id}")
+            
+        os.makedirs(base_folder, exist_ok=True)
+        # ----------------------------
+
+        # 1. Handle Top Camera
         top_crop = self._crop(frame_top, track_obj['top']['box']) if track_obj.get('top') else None
-        top_path_rel = os.path.join(id_folder_rel, f"top_{ts}.jpg") #
+        
+        # Simpan path relatif untuk DB (opsional: bisa simpan full path atau relatif terhadap snapshot dir)
+        # Kita simpan relatif agar fleksibel
+        db_path_top = None
         
         if top_crop is not None:
-            top_path_abs = os.path.join(settings.SNAPSHOT_DIR, top_path_rel)
-            self.executor.submit(self._save_file, top_path_abs, top_crop) #
+            filename_top = f"top_{ts}.jpg"
+            abs_path_top = os.path.join(base_folder, filename_top)
+            
+            # Path relatif untuk disimpan di DB (misal: "20260304_120000/id_1/top_...jpg")
+            rel_folder = os.path.relpath(base_folder, settings.SNAPSHOT_DIR)
+            db_path_top = os.path.join(rel_folder, filename_top).replace("\\", "/") # Force forward slash for consistency
+            
+            self.executor.submit(self._save_file, abs_path_top, top_crop)
 
-        # 3. Handle Side Camera
-        side_path_rel = None
+        # 2. Handle Side Camera
+        side_crop = None
+        db_path_side = None
+        
         if track_obj.get('is_fused') and track_obj.get('side') and frame_side is not None:
             side_crop = self._crop(frame_side, track_obj['side']['box'])
             if side_crop is not None:
-                side_path_rel = os.path.join(id_folder_rel, f"side_{ts}.jpg") #
-                side_path_abs = os.path.join(settings.SNAPSHOT_DIR, side_path_rel)
-                self.executor.submit(self._save_file, side_path_abs, side_crop) #
+                filename_side = f"side_{ts}.jpg"
+                abs_path_side = os.path.join(base_folder, filename_side)
+                
+                rel_folder = os.path.relpath(base_folder, settings.SNAPSHOT_DIR)
+                db_path_side = os.path.join(rel_folder, filename_side).replace("\\", "/")
+                
+                self.executor.submit(self._save_file, abs_path_side, side_crop)
 
-        # 4. Update Database with the new relative paths
-        self.executor.submit(self._update_db, runtime_id, top_path_rel, side_path_rel, track_obj) #
+        # 3. Update Database
+        self.executor.submit(self._update_db, runtime_id, db_path_top, db_path_side, track_obj, session_id)
         
         track_obj['has_snapshot'] = True
-        track_obj['snapshot_paths'] = (top_path_rel, side_path_rel) #
+        track_obj['snapshot_paths'] = (db_path_top, db_path_side)
 
     def _crop(self, frame, box):
         if frame is None or not box: return None
@@ -61,18 +86,28 @@ class SnapshotService:
             return frame[y1c:y2c, x1c:x2c].copy()
         return None
 
-    def _update_db(self, runtime_id, top_path, side_path, track_data):
+    def _update_db(self, runtime_id, top_path, side_path, track_data, session_id=None):
         db = SessionLocal()
         try:
-            obj = db.query(FusedObject).filter(FusedObject.track_id == runtime_id).first()
+            # FILTER BERDASARKAN TRACK_ID *DAN* SESSION_ID
+            # Ini penting agar ID 1 di Sesi A tidak tertukar dengan ID 1 di Sesi B
+            query = db.query(FusedObject).filter(FusedObject.track_id == runtime_id)
+            
+            if session_id:
+                query = query.filter(FusedObject.session_id == session_id)
+            else:
+                query = query.filter(FusedObject.session_id.is_(None))
+                
+            obj = query.first()
+            
             if not obj:
-                obj = FusedObject(track_id=runtime_id)
+                # Simpan session_id saat membuat baru
+                obj = FusedObject(track_id=runtime_id, session_id=session_id)
                 db.add(obj)
             
-            obj.snapshot_top = top_path
-            obj.snapshot_side = side_path
+            if top_path: obj.snapshot_top = top_path
+            if side_path: obj.snapshot_side = side_path
             
-            # Save Metadata (Dengan konversi ke float standar Python)
             if track_data.get('top') and track_data['top'].get('center'):
                 obj.top_center_x = float(track_data['top']['center'][0])
                 obj.top_center_y = float(track_data['top']['center'][1])
@@ -81,7 +116,6 @@ class SnapshotService:
                 obj.side_center_x = float(track_data['side']['bottom_center'][0])
                 obj.side_center_y = float(track_data['side']['bottom_center'][1])
 
-            # Save Weight and Fusion Status (FIX: Convert numpy float to python float)
             est_weight = track_data.get('estimated_weight')
             if est_weight is not None:
                 obj.estimated_weight = float(est_weight)
