@@ -2,7 +2,7 @@ import os
 from flask_cors import CORS
 import atexit
 import multiprocessing
-from flask import Flask
+from flask import Flask, send_from_directory
 from app.core.config import settings
 from app.api import rest
 from app.api.webrtc import run_webrtc_thread
@@ -17,6 +17,10 @@ def create_app(start_services=True):
     app = Flask(__name__, template_folder=template_dir)
     CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
     app.register_blueprint(rest.api)
+
+    @app.route('/snapshots/<path:filename>')
+    def serve_snapshot(filename):
+        return send_from_directory(settings.SNAPSHOT_DIR, filename)
 
     if start_services:
         # Start Services

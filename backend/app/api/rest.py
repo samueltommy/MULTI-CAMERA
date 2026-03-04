@@ -3,6 +3,9 @@ from app.services.fusion import fusion_service
 from app.services.pipeline import pipeline_service
 from app.services.calibration import calibration_service
 from app.core.config import settings
+from app.database.session import SessionLocal
+from app.database.models import FusedObject
+from sqlalchemy import desc
 import numpy as np
 import os
 import time
@@ -211,3 +214,120 @@ def streams():
     return jsonify({
         'outputs': {'cam1': settings.OUTPUT_URL_1, 'cam2': settings.OUTPUT_URL_2}
     })
+
+@api.route('/object_details', methods=['GET'])
+def get_object_details():
+    """
+    Mengambil detail lengkap (Foto Top/Side, Berat) untuk satu ID ayam.
+    Dipanggil saat user mengklik baris di tabel kiri.
+    """
+    track_id = request.args.get('track_id')
+    session_id = request.args.get('session_id')
+    
+    if not track_id:
+        return jsonify({"error": "track_id is required"}), 400
+        
+    db = SessionLocal()
+    try:
+        query = db.query(FusedObject).filter(FusedObject.track_id == track_id)
+        if session_id:
+            query = query.filter(FusedObject.session_id == session_id)
+            
+        # Ambil data paling update (terakhir direkam)
+        obj = query.order_by(desc(FusedObject.created_at)).first()
+        
+        if not obj:
+            return jsonify({"error": "Object not found"}), 404
+            
+        data = obj.to_dict()
+        
+        # Generate URL Gambar untuk Frontend
+        host_url = request.host_url.rstrip('/') # http://localhost:5000
+        
+        if data.get('snapshot_top'):
+            data['image_url_top'] = f"{host_url}/snapshots/{data['snapshot_top']}"
+        else:
+            data['image_url_top'] = None
+            
+        if data.get('snapshot_side'):
+            data['image_url_side'] = f"{host_url}/snapshots/{data['snapshot_side']}"
+        else:
+            data['image_url_side'] = None
+            
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+# --- BARU: List Semua Sesi ---
+@api.route('/sessions', methods=['GET'])
+def get_sessions():
+    """Mengambil daftar semua Session ID yang ada di database."""
+    db = SessionLocal()
+    try:
+        # Ambil session_id yang unik
+        sessions = db.query(FusedObject.session_id)\
+                     .filter(FusedObject.session_id.isnot(None))\
+                     .distinct().all()
+        
+        # Convert list of tuples ke list of strings
+        session_list = [s[0] for s in sessions]
+        
+        # Urutkan dari yang terbaru (Descending)
+        session_list.sort(reverse=True)
+        
+        return jsonify({
+            "sessions": session_list,
+            "current_active": pipeline_service.current_session_id
+        })
+    finally:
+        db.close()
+
+# --- BARU: List Objek untuk Tabel Kiri ---
+@api.route('/session_objects', methods=['GET'])
+def get_session_objects():
+    """
+    Mengambil daftar ID ayam dan berat terakhirnya dalam satu sesi.
+    Output urut dari ID terkecil ke terbesar.
+    """
+    session_id = request.args.get('session_id')
+    
+    # Jika parameter kosong, gunakan sesi yang sedang berjalan (jika ada)
+    if not session_id:
+        session_id = pipeline_service.current_session_id
+        
+    if not session_id:
+        return jsonify([]) # Tidak ada sesi aktif
+
+    db = SessionLocal()
+    try:
+        # Ambil semua data pada sesi ini, urutkan dari yang terbaru
+        rows = db.query(FusedObject)\
+                 .filter(FusedObject.session_id == session_id)\
+                 .order_by(desc(FusedObject.created_at))\
+                 .all()
+        
+        # Filter: Hanya ambil data TERBARU untuk setiap track_id
+        unique_map = {}
+        for row in rows:
+            if row.track_id not in unique_map:
+                unique_map[row.track_id] = {
+                    "track_id": row.track_id,
+                    "estimated_weight": row.estimated_weight,
+                    "last_seen": row.created_at.isoformat() if row.created_at else None
+                }
+        
+        # Ubah ke list
+        result = list(unique_map.values())
+        
+        # SORTING: Urutkan berdasarkan ID Terkecil (Ascending)
+        # Ini memudahkan frontend untuk auto-select index[0]
+        result.sort(key=lambda x: x['track_id'])
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
