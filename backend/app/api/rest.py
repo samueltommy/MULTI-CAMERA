@@ -9,6 +9,7 @@ from sqlalchemy import desc
 import numpy as np
 import os
 import time
+from datetime import datetime
 
 api = Blueprint('api', __name__)
 
@@ -327,6 +328,36 @@ def get_session_objects():
         
         return jsonify(result)
         
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+@api.route('/farm_settings', methods=['GET', 'POST'])
+def handle_farm_settings():
+    from app.database.models import FarmSettings
+    db = SessionLocal()
+    try:
+        settings = db.query(FarmSettings).first()
+        if not settings:
+            settings = FarmSettings()
+            db.add(settings)
+            db.commit()
+
+        if request.method == 'POST':
+            data = request.json
+            if 'chick_in_date' in data:
+                if data['chick_in_date']:
+                    settings.chick_in_date = datetime.strptime(data['chick_in_date'], '%Y-%m-%d').date()
+                else:
+                    settings.chick_in_date = None
+                    
+            if 'manual_age_override' in data:
+                settings.manual_age_override = data['manual_age_override'] if data['manual_age_override'] != "" else None
+                
+            db.commit()
+            
+        return jsonify(settings.to_dict())
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:

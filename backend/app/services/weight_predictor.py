@@ -4,6 +4,7 @@ class WeightPredictor:
     def __init__(self, standard_width=1280, standard_height=720):
         self.standard_width = standard_width
         self.standard_height = standard_height
+        self.cm_per_pixel = None
         
         # 1. Kalibrasi dari yolo_multiclass_weight.py
         self.calibration_data = {
@@ -45,6 +46,10 @@ class WeightPredictor:
             {'name': 'Feeder', 'coords': (730, 170, 910, 320)}
         ]
 
+    def set_scale_ratio(self, ratio):
+        self.cm_per_pixel = ratio
+        print(f"Weight Predictor now using scale: {ratio:.4f} cm/pixel")
+
     def is_in_obstacle_zone(self, centroid):
         cx, cy = centroid
         for mask in self.obstacle_masks:
@@ -61,22 +66,39 @@ class WeightPredictor:
                 return region['factor']
         return 1.0
 
-    def predict_from_area(self, top_box, class_name, frame_shape):
+    def predict_from_area(self, top_det, class_name, frame_shape):
         """Algoritma 2D: Persis sama dengan yolo_multiclass_weight.py untuk objek TANPA fusion."""
-        x1, y1, x2, y2 = top_box
-        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        x1, y1, x2, y2 = top_det['box']
+        cx, cy = top_det['center']
         
         # Abaikan jika masuk obstacle zone
         if self.is_in_obstacle_zone((cx, cy)):
-            return -1.0 
-            
-        area = (x2 - x1) * (y2 - y1)
-        if area < 100: return 0.0
-            
-        frame_scale = min(self.standard_width / frame_shape[1], self.standard_height / frame_shape[0]) if frame_shape else 1.0
-        normalized_area = area / (frame_scale * frame_scale)
-        base_weight = 1.920 * (normalized_area / 71667)
+            return -1.0
         
+        if top_det.get('mask_area') and top_det['mask_area'] > 0:
+            area_px = top_det['mask_area'] # Ekstraksi lekuk tubuh asli
+        else:
+            area_px = (x2 - x1) * (y2 - y1) # Fallback pakai Bounding Box
+
+        if area_px < 100: return 0.0 # Abaikan jika area terlalu kecil (noise)
+            
+        if self.cm_per_pixel is None:
+            # Fallback jika belum kalibrasi ArUco (Pakai rasio layar standar)
+            frame_scale = min(self.standard_width / frame_shape[1], self.standard_height / frame_shape[0]) if frame_shape else 1.0
+            normalized_area = area_px / (frame_scale * frame_scale)
+            base_weight = 1.920 * (normalized_area / 71667.0)
+        else:
+            # KALIBRASI ARUCO AKTIF: Area piksel dikali kuadrat dari resolusi spasial
+            area_cm2 = area_px * (self.cm_per_pixel ** 2)
+            
+            if area_cm2 < 10: return 0.0 
+            
+            # Pembagi 400.0 cm^2 adalah nilai asumsi luas ayam ukuran dewasa
+            # (Anda bisa menyesuaikan (tuning) angka 400.0 ini nanti saat pengujian)
+            normalized_area = area_cm2 / 400.0 
+            base_weight = 1.920 * normalized_area
+            
+        # 3. Hitung Berat Final
         factor = self.weight_factors.get(class_name, 0.78)
         scaled_weight = base_weight * factor
         
@@ -86,28 +108,48 @@ class WeightPredictor:
         final_weight = calibrated_weight * self.get_region_factor((cx, cy))
         return max(0.0, final_weight)
 
-    def predict_from_volume(self, top_box, side_box, class_name, frame_shape):
+    def predict_from_volume(self, top_det, side_det, class_name, frame_shape):
         """Algoritma 3D: Untuk ayam yang TER-FUSION oleh kedua kamera."""
-        x1_t, y1_t, x2_t, y2_t = top_box
-        x1_s, y1_s, x2_s, y2_s = side_box
-        cx, cy = (x1_t + x2_t) / 2.0, (y1_t + y2_t) / 2.0
+        x1_t, y1_t, x2_t, y2_t = top_det['box']
+        x1_s, y1_s, x2_s, y2_s = side_det['box']
+        cx, cy = top_det['center']
         
         if self.is_in_obstacle_zone((cx, cy)):
             return -1.0
             
-        width = x2_t - x1_t
-        length = y2_t - y1_t
-        height = y2_s - y1_s  # Mengambil tinggi dari kamera samping
+        # 1. Dapatkan Luas Alas dalam Piksel (Dari Top Camera)
+        if top_det.get('mask_area') and top_det['mask_area'] > 0:
+            base_area_px = top_det['mask_area']
+        else:
+            base_area_px = (x2_t - x1_t) * (y2_t - y1_t)
+            
+        # 2. Dapatkan Tinggi dari Side Camera (Kita pakai Bounding Box Height karena 
+        # tinggi ayam merepresentasikan postur vertikal penuhnya)
+        height_px = y2_s - y1_s
         
-        volume_idx = width * length * height
-        if volume_idx < 1000: return 0.0
+        # Volume 3D dalam satuan piksel
+        volume_px3 = base_area_px * height_px
         
-        frame_scale = min(self.standard_width / frame_shape[1], self.standard_height / frame_shape[0]) if frame_shape else 1.0
-        normalized_vol = volume_idx / (frame_scale**3)
-        
-        # Sesuaikan pembagi ini (71667 * 150) dengan data riil volume Anda nanti
-        base_weight = 1.920 * (normalized_vol / (71667 * 150)) 
-        
+        if volume_px3 < 1000: return 0.0
+            
+        # 3. Hitung Normalisasi Volume
+        if self.cm_per_pixel is None:
+            # Fallback tanpa ArUco
+            frame_scale = min(self.standard_width / frame_shape[1], self.standard_height / frame_shape[0]) if frame_shape else 1.0
+            normalized_vol = volume_px3 / (frame_scale ** 3)
+            base_weight = 1.920 * (normalized_vol / (71667 * 150))
+        else:
+            # KALIBRASI ARUCO AKTIF: Volume piksel dikali pangkat 3 dari resolusi spasial
+            volume_cm3 = volume_px3 * (self.cm_per_pixel ** 3)
+            
+            if volume_cm3 < 100: return 0.0
+            
+            # Pembagi 5000.0 cm^3 adalah asumsi volume spasial tubuh ayam dewasa
+            # (Anda bisa melakukan tuning angka 5000.0 ini agar hasilnya presisi)
+            normalized_vol = volume_cm3 / 5000.0
+            base_weight = 1.920 * normalized_vol
+            
+        # 4. Hitung Berat Final
         factor = self.weight_factors.get(class_name, 0.78)
         scaled_weight = base_weight * factor
         

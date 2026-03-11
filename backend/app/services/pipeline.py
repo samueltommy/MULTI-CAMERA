@@ -298,7 +298,7 @@ class PipelineService:
                     side_box = fo['side'].get('box')
                     top_center = fo['top'].get('center')
                     
-                    raw_weight = weight_predictor.predict_from_volume(top_box, side_box, 'chicken', frame_shape)
+                    raw_weight = weight_predictor.predict_from_volume(fo['top'], fo['side'], 'chicken', frame_shape)
                     final_weight = self._get_smart_weight(obj_id, top_center, raw_weight)
 
                     if final_weight >= 0:
@@ -338,7 +338,7 @@ class PipelineService:
                                 
                         if not is_already_fused:
                             top_box = det_top.get('box')
-                            raw_weight = weight_predictor.predict_from_area(top_box, 'chicken', frame_shape)
+                            raw_weight = weight_predictor.predict_from_area(det_top, 'chicken', frame_shape)
                             final_weight = self._get_smart_weight(obj_id, top_center, raw_weight)
                             
                             if final_weight >= 0:

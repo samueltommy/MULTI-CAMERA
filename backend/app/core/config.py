@@ -82,5 +82,6 @@ class Config:
     CALIBRATION_POINTS = int(os.environ.get('CALIBRATION_POINTS', '5'))
     TURN_USER = os.environ.get('TURN_USER', '')
     TURN_PASS = os.environ.get('TURN_PASS', '')
+    ARUCO_SIZE_CM = float(os.environ.get('ARUCO_SIZE_CM', '5.0'))
 
 settings = Config()

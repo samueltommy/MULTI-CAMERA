@@ -6,6 +6,7 @@ from app.services.camera import camera_manager
 from app.database.session import SessionLocal
 from app.database.models import Calibration
 from app.services.fusion import fusion_service
+from app.core.config import settings
 
 class CalibrationService:
     def __init__(self):
@@ -50,6 +51,25 @@ class CalibrationService:
         
         if not common_ids:
             return False, "No common markers found in both cameras"
+        
+        pixel_widths = []
+        for i, marker_id in enumerate(ids1.flatten()):
+            if marker_id in common_ids:
+                # Ambil 4 sudut dari marker di kamera Atas (Top Camera)
+                c = corners1[i][0]
+                # Hitung jarak piksel dari sudut kiri atas ke kanan atas (Lebar marker)
+                width_px = np.linalg.norm(c[0] - c[1])
+                pixel_widths.append(width_px)
+        
+        if pixel_widths:
+            avg_width_px = np.mean(pixel_widths)
+            # Rumus: Rasio = Ukuran Asli (cm) / Ukuran Piksel
+            self.cm_per_pixel = settings.ARUCO_SIZE_CM / avg_width_px
+            print(f"CALIBRATION SCALE: 1 Pixel = {self.cm_per_pixel:.4f} cm")
+            
+            # Simpan rasio ini ke weight_predictor agar bisa dipakai memprediksi berat
+            from app.services.weight_predictor import weight_predictor
+            weight_predictor.set_scale_ratio(self.cm_per_pixel)
 
         new_count = 0
         for cid in common_ids:

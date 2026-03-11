@@ -88,6 +88,12 @@ def worker_process_func(in_q, out_q, model_path, device_name, use_half, enable_m
                          track_ids = res.boxes.id.int().cpu().numpy()
                     else:
                          track_ids = [-1] * len(boxes)
+
+                    masks_data = None
+                    # Cek apakah model mendeteksi mask segmentasi
+                    if hasattr(res, 'masks') and res.masks is not None:
+                        masks_data = res.masks.data.cpu().numpy() # Bentuk array 0 dan 1
+
                 except Exception:
                     pass
 
@@ -96,13 +102,21 @@ def worker_process_func(in_q, out_q, model_path, device_name, use_half, enable_m
                     x1, y1, x2, y2 = [int(v) for v in box]
                     cx = (x1 + x2) / 2.0
                     cy = (y1 + y2) / 2.0
+                    mask_area = 0.0
+                    if masks_data is not None and i < len(masks_data):
+                        # Hitung total piksel yang benar-benar merupakan tubuh ayam
+                        mask_area = np.sum(masks_data[i])
+                    else:
+                        # Fallback jika mask gagal/tidak ada: pakai luas kotak
+                        mask_area = float((x2 - x1) * (y2 - y1))
                     detections.append({
                         'box': [x1, y1, x2, y2], 
                         'score': float(score), 
                         'cls': int(cls), 
                         'track_id': int(tid), 
                         'center': (cx, cy), 
-                        'bottom_center': ((x1 + x2) / 2.0, float(y2))
+                        'bottom_center': ((x1 + x2) / 2.0, float(y2)),
+                        'mask_area': float(mask_area)
                     })
 
                 # --- PERBAIKAN: DEFINISIKAN ANNOTATED ---

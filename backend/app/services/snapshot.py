@@ -89,38 +89,64 @@ class SnapshotService:
     def _update_db(self, runtime_id, top_path, side_path, track_data, session_id=None):
         db = SessionLocal()
         try:
-            # FILTER BERDASARKAN TRACK_ID *DAN* SESSION_ID
-            # Ini penting agar ID 1 di Sesi A tidak tertukar dengan ID 1 di Sesi B
-            query = db.query(FusedObject).filter(FusedObject.track_id == runtime_id)
+            # 1. Hitung Umur Ayam
+            from app.database.models import FarmSettings
+            import datetime as dt
             
+            settings = db.query(FarmSettings).first()
+            current_age = 0
+            if settings:
+                if settings.manual_age_override:
+                    current_age = settings.manual_age_override
+                elif settings.chick_in_date:
+                    delta = dt.date.today() - settings.chick_in_date
+                    current_age = max(0, delta.days)
+
+            # 2. Query Objek
+            query = db.query(FusedObject).filter(FusedObject.track_id == runtime_id)
             if session_id:
                 query = query.filter(FusedObject.session_id == session_id)
             else:
                 query = query.filter(FusedObject.session_id.is_(None))
                 
             obj = query.first()
-            
             if not obj:
-                # Simpan session_id saat membuat baru
                 obj = FusedObject(track_id=runtime_id, session_id=session_id)
                 db.add(obj)
             
+            # 3. Simpan Path & Metadata Standar
             if top_path: obj.snapshot_top = top_path
             if side_path: obj.snapshot_side = side_path
             
             if track_data.get('top') and track_data['top'].get('center'):
                 obj.top_center_x = float(track_data['top']['center'][0])
                 obj.top_center_y = float(track_data['top']['center'][1])
+                obj.score = float(track_data['top'].get('score', 0.98))
                 
             if track_data.get('side') and track_data['side'].get('bottom_center'):
                 obj.side_center_x = float(track_data['side']['bottom_center'][0])
                 obj.side_center_y = float(track_data['side']['bottom_center'][1])
 
-            est_weight = track_data.get('estimated_weight')
-            if est_weight is not None:
-                obj.estimated_weight = float(est_weight)
-            
+            obj.estimated_weight = float(track_data.get('estimated_weight', 0))
             obj.is_fused = track_data.get('is_fused', False)
+            obj.age_days = current_age
+            
+            # --- 4. SIMPAN RAW FEATURES UNTUK MACHINE LEARNING ---
+            if track_data.get('top'):
+                top_box = track_data['top'].get('box')
+                if top_box:
+                    obj.bbox_width_px = float(top_box[2] - top_box[0])
+                obj.mask_area_px = float(track_data['top'].get('mask_area', 0.0))
+                
+            if track_data.get('side'):
+                side_box = track_data['side'].get('box')
+                if side_box:
+                    obj.bbox_height_px = float(side_box[3] - side_box[1])
+
+            # Ambil skala kalibrasi ArUco saat ini
+            from app.services.weight_predictor import weight_predictor
+            obj.cm_per_pixel = weight_predictor.cm_per_pixel
+            # -----------------------------------------------------
                 
             db.commit()
         except Exception as e:
