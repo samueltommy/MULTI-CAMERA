@@ -11,7 +11,7 @@ from sqlalchemy import desc
 import numpy as np
 import os
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 api = Blueprint('api', __name__)
 
@@ -434,49 +434,60 @@ def get_harvest_prediction():
 
 @api.route('/growth_chart', methods=['GET'])
 def get_growth_chart():
-    """API untuk mengirim data grafik perbandingan AI vs Standar Ciomas"""
+    """API untuk mengirim data grafik perbandingan AI vs Standar Ciomas (Default 40 Hari)"""
     db = SessionLocal()
     try:
         # 1. Ambil tanggal chick-in
         settings = db.query(FarmSettings).first()
+        
+        # Peringatan ramah jika tanggal belum diatur (Menghindari Error 400)
         if not settings or not settings.chick_in_date:
-            return jsonify({"error": "Tanggal Chick-in belum diatur di Farm Settings."}), 400
+            return jsonify({
+                "status": "error", 
+                "error": "Silakan atur 'Chick-in Date' pada menu Settings (⚙️) di pojok kanan atas agar grafik dapat ditampilkan."
+            }), 200
 
         chick_in = settings.chick_in_date
         
         # 2. Ambil riwayat akumulasi harian dari AI
-        daily_stats = db.query(DailyStat).order_by(DailyStat.date.asc()).all()
+        daily_stats = db.query(DailyStat).all()
         
-        # 3. Kamus (Dictionary) Standar Ciomas dari Excel Anda (dalam KG)
-        # Saya memasukkan data dari Umur 0 sampai 35 sesuai gambar Excel Anda.
+        # Buat pemetaan (dictionary) data aktual berdasarkan umurnya
+        actual_data_map = {}
+        for stat in daily_stats:
+            age_days = (stat.date - chick_in).days
+            if age_days >= 0:
+                actual_data_map[age_days] = stat.daily_average_kg
+        
+        # 3. Kamus Standar Ciomas
         ciomas_standard = {
             0: 0.042, 1: 0.056, 2: 0.073, 3: 0.094, 4: 0.118, 5: 0.145, 6: 0.176,
             7: 0.210, 8: 0.247, 9: 0.288, 10: 0.332, 11: 0.379, 12: 0.429, 13: 0.483,
             14: 0.540, 15: 0.600, 16: 0.663, 17: 0.729, 18: 0.798, 19: 0.870, 20: 0.945,
             21: 1.024, 22: 1.105, 23: 1.189, 24: 1.276, 25: 1.365, 26: 1.457, 27: 1.552,
             28: 1.649, 29: 1.747, 30: 1.846, 31: 1.945, 32: 2.045, 33: 2.146, 34: 2.247,
-            35: 2.348 # (Asumsi +100g dari hari 34)
+            35: 2.348
         }
 
         chart_data = []
-        for stat in daily_stats:
-            # Hitung umur ayam di tanggal rekaman tersebut
-            age_days = (stat.date - chick_in).days
-            
-            if age_days < 0:
-                continue # Abaikan jika data terekam sebelum ayam masuk
-                
-            # Ambil target dari tabel Ciomas
+        
+        # 4. LOOPING MEMAKSA RENTANG 0 SAMPAI 40 HARI
+        for age_days in range(41):
+            # Ambil target ciomas (jika > 35 hari, ekstrapolasi tambah 100g/hari)
             target_bw = ciomas_standard.get(age_days)
-            if target_bw is None and age_days > 35:
-                 target_bw = 2.348 + ((age_days - 35) * 0.1) # Ekstrapolasi kasar jika umur > 35 hari
+            if target_bw is None:
+                 target_bw = 2.348 + ((age_days - 35) * 0.1)
+
+            # Hitung tanggal jatuhnya hari tersebut
+            current_date = chick_in + timedelta(days=age_days)
 
             # Masukkan ke format data grafik
             chart_data.append({
-                "date": stat.date.strftime("%d %b"), # Format contoh: 12 Mar
+                "date": current_date.strftime("%d %b"),
                 "age_days": age_days,
-                "actual_weight_kg": round(stat.daily_average_kg, 3),
-                "target_weight_kg": round(target_bw, 3) if target_bw else 0
+                # Jika hari ini ada data kamera, masukkan. Jika belum/tidak ada, kirim None (null)
+                "actual_weight_kg": round(actual_data_map[age_days], 3) if age_days in actual_data_map else None,
+                "target_weight_kg": round(target_bw, 3)
             })
 
         return jsonify({
