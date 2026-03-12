@@ -19,8 +19,8 @@ def worker_process_func(in_q, out_q, model_path, device_name, use_half, enable_m
         try:
             for m in models:
                 m.to(dev)
-                if dev != 'cpu' and use_half:
-                     m.model.half()
+                # if dev != 'cpu' and use_half:
+                #      m.model.half()
         except Exception:
             pass
 
@@ -63,7 +63,7 @@ def worker_process_func(in_q, out_q, model_path, device_name, use_half, enable_m
                         device=dev, 
                         half=use_half_local, 
                         conf=conf, 
-                        persist=True,      # Wajib True agar ID diingat antar frame
+                        persist=True,
                         tracker="bytetrack.yaml", 
                         verbose=False
                     )

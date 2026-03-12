@@ -74,7 +74,6 @@ class PipelineService:
 
     def start_session(self, duration=60):
         print(f"Starting triggered session for {duration} seconds")
-        # 1. Generate Session ID (Folder Name) berdasarkan waktu sekarang
         self.current_session_id = time.strftime('%Y%m%d_%H%M%S')
         
         self.best_session_result = {
@@ -82,7 +81,34 @@ class PipelineService:
         }
         self.session_end_time = time.time() + duration
         self.session_active = True
-        # Start video recording
+        
+        # =================================================================
+        # TAMBAHAN: UPDATE BATAS OUTLIER BERDASARKAN UMUR AYAM HARI INI
+        # =================================================================
+        from app.database.session import SessionLocal
+        from app.database.models import FarmSettings
+        from datetime import date
+        from app.services.weight_predictor import weight_predictor
+        
+        db = SessionLocal()
+        try:
+            settings_db = db.query(FarmSettings).first()
+            age_days = 0
+            if settings_db:
+                if settings_db.manual_age_override:
+                    age_days = settings_db.manual_age_override
+                elif settings_db.chick_in_date:
+                    delta = date.today() - settings_db.chick_in_date
+                    age_days = max(0, delta.days)
+            
+            # Kirim umur ke predictor agar batas outliernya disesuaikan
+            weight_predictor.update_age_limits(age_days)
+        except Exception as e:
+            print(f"[Pipeline] Error setting dynamic outlier: {e}")
+        finally:
+            db.close()
+        # =================================================================
+
         video_recorder.start_session(fps=settings.MOTION_HIGH_FPS)
 
     def stop_session(self):
@@ -90,6 +116,14 @@ class PipelineService:
         # self.current_session_id = None # Opsional: reset atau biarkan
         print("Session force stopped")
         video_recorder.stop_session()
+
+        if self.current_session_id:
+            from app.services.statistics import ml_statistics_service
+            threading.Thread(
+                target=ml_statistics_service.process_session, 
+                args=(self.current_session_id,), 
+                daemon=True
+            ).start()
 
     # ... (Method start, stop, mark_started_on_demand, enable_inference, _draw_detections SAMA SEPERTI SEBELUMNYA) ...
     def start(self, inference_enabled=False):
@@ -404,6 +438,15 @@ class PipelineService:
                         self.session_active = False
                         print(f"Session finished. Best count: {self.best_session_result['count']}")
                         video_recorder.stop_session()
+                        if self.current_session_id:
+                            from app.services.statistics import ml_statistics_service
+                            # Menjalankan di thread terpisah agar pipeline tidak berhenti/lag
+                            threading.Thread(
+                                target=ml_statistics_service.process_session, 
+                                args=(self.current_session_id,), 
+                                daemon=True
+                            ).start()
+
                         if self.inference_enabled:
                             try:
                                 print("[pipeline] session finished; disabling inference")

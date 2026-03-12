@@ -2,14 +2,16 @@ from flask import Blueprint, jsonify, request, send_from_directory, render_templ
 from app.services.fusion import fusion_service
 from app.services.pipeline import pipeline_service
 from app.services.calibration import calibration_service
+from app.services.growth_predictor import growth_predictor
 from app.core.config import settings
 from app.database.session import SessionLocal
 from app.database.models import FusedObject
+from app.database.models import DailyStat, FarmSettings
 from sqlalchemy import desc
 import numpy as np
 import os
 import time
-from datetime import datetime
+from datetime import datetime, date
 
 api = Blueprint('api', __name__)
 
@@ -335,7 +337,6 @@ def get_session_objects():
 
 @api.route('/farm_settings', methods=['GET', 'POST'])
 def handle_farm_settings():
-    from app.database.models import FarmSettings
     db = SessionLocal()
     try:
         settings = db.query(FarmSettings).first()
@@ -347,17 +348,142 @@ def handle_farm_settings():
         if request.method == 'POST':
             data = request.json
             if 'chick_in_date' in data:
-                if data['chick_in_date']:
-                    settings.chick_in_date = datetime.strptime(data['chick_in_date'], '%Y-%m-%d').date()
-                else:
-                    settings.chick_in_date = None
-                    
+                settings.chick_in_date = datetime.strptime(data['chick_in_date'], '%Y-%m-%d').date() if data['chick_in_date'] else None
             if 'manual_age_override' in data:
                 settings.manual_age_override = data['manual_age_override'] if data['manual_age_override'] != "" else None
+            
+            # TAMBAHAN UNTUK TARGET PANEN
+            if 'target_harvest_weight_kg' in data:
+                settings.target_harvest_weight_kg = float(data['target_harvest_weight_kg'])
                 
             db.commit()
-            
         return jsonify(settings.to_dict())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+@api.route('/daily_statistics', methods=['GET'])
+def get_daily_statistics():
+    """Mengambil hasil kalkulasi AI harian (sangat cepat karena sudah di-precompute)"""
+    db = SessionLocal()
+    try:
+        # Cek parameter tanggal, jika tidak ada, gunakan hari ini
+        date_str = request.args.get('date')
+        if date_str:
+            target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        else:
+            target_date = date.today()
+
+        # Langsung ambil data yang sudah dihitung oleh statistics.py
+        stat = db.query(DailyStat).filter(DailyStat.date == target_date).first()
+
+        if not stat:
+            return jsonify({
+                "date": target_date.isoformat(),
+                "total_sessions": 0,
+                "total_chickens": 0,
+                "daily_average_kg": 0.0,
+                "message": "Belum ada data penimbangan untuk tanggal ini."
+            })
+
+        return jsonify(stat.to_dict())
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+@api.route('/harvest_prediction', methods=['GET'])
+def get_harvest_prediction():
+    db = SessionLocal()
+    try:
+        # A. Ambil setting Target Berat dari Database
+        settings = db.query(FarmSettings).first()
+        target_weight = settings.target_harvest_weight_kg if settings else 2.0
+        
+        # B. Ambil Berat Rata-rata Harian Terkini (Hasil dari Isolation Forest ML)
+        today = date.today()
+        daily_stat = db.query(DailyStat).filter(DailyStat.date == today).first()
+        
+        if not daily_stat or daily_stat.daily_average_kg <= 0:
+            return jsonify({
+                "status": "waiting_for_data",
+                "message": "Silakan jalankan deteksi kamera terlebih dahulu hari ini untuk mendapatkan prediksi panen."
+            })
+            
+        current_weight = daily_stat.daily_average_kg
+        
+        # C. Minta AI (Polynomial ML) menghitung prediksi waktunya
+        prediction = growth_predictor.predict_harvest(current_weight, target_weight)
+        
+        # D. Gabungkan info tambahan (opsional)
+        if settings and settings.chick_in_date:
+            calendar_age = (today - settings.chick_in_date).days
+            prediction["calendar_age_days"] = max(0, calendar_age)
+        
+        return jsonify({
+            "status": "success",
+            "prediction": prediction
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+@api.route('/growth_chart', methods=['GET'])
+def get_growth_chart():
+    """API untuk mengirim data grafik perbandingan AI vs Standar Ciomas"""
+    db = SessionLocal()
+    try:
+        # 1. Ambil tanggal chick-in
+        settings = db.query(FarmSettings).first()
+        if not settings or not settings.chick_in_date:
+            return jsonify({"error": "Tanggal Chick-in belum diatur di Farm Settings."}), 400
+
+        chick_in = settings.chick_in_date
+        
+        # 2. Ambil riwayat akumulasi harian dari AI
+        daily_stats = db.query(DailyStat).order_by(DailyStat.date.asc()).all()
+        
+        # 3. Kamus (Dictionary) Standar Ciomas dari Excel Anda (dalam KG)
+        # Saya memasukkan data dari Umur 0 sampai 35 sesuai gambar Excel Anda.
+        ciomas_standard = {
+            0: 0.042, 1: 0.056, 2: 0.073, 3: 0.094, 4: 0.118, 5: 0.145, 6: 0.176,
+            7: 0.210, 8: 0.247, 9: 0.288, 10: 0.332, 11: 0.379, 12: 0.429, 13: 0.483,
+            14: 0.540, 15: 0.600, 16: 0.663, 17: 0.729, 18: 0.798, 19: 0.870, 20: 0.945,
+            21: 1.024, 22: 1.105, 23: 1.189, 24: 1.276, 25: 1.365, 26: 1.457, 27: 1.552,
+            28: 1.649, 29: 1.747, 30: 1.846, 31: 1.945, 32: 2.045, 33: 2.146, 34: 2.247,
+            35: 2.348 # (Asumsi +100g dari hari 34)
+        }
+
+        chart_data = []
+        for stat in daily_stats:
+            # Hitung umur ayam di tanggal rekaman tersebut
+            age_days = (stat.date - chick_in).days
+            
+            if age_days < 0:
+                continue # Abaikan jika data terekam sebelum ayam masuk
+                
+            # Ambil target dari tabel Ciomas
+            target_bw = ciomas_standard.get(age_days)
+            if target_bw is None and age_days > 35:
+                 target_bw = 2.348 + ((age_days - 35) * 0.1) # Ekstrapolasi kasar jika umur > 35 hari
+
+            # Masukkan ke format data grafik
+            chart_data.append({
+                "date": stat.date.strftime("%d %b"), # Format contoh: 12 Mar
+                "age_days": age_days,
+                "actual_weight_kg": round(stat.daily_average_kg, 3),
+                "target_weight_kg": round(target_bw, 3) if target_bw else 0
+            })
+
+        return jsonify({
+            "status": "success", 
+            "data": chart_data
+        })
+        
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
