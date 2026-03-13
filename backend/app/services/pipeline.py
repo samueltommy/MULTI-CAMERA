@@ -342,7 +342,9 @@ class PipelineService:
                             'side': fo['side'],
                             'is_fused': True,
                             'estimated_weight': final_weight,
-                            'has_snapshot': False
+                            'has_snapshot': False,
+                            'class_name': fo['top'].get('class_name', 'chicken'),
+                            'score': fo['top'].get('score', 0.0)
                         }
                         # KIRIM SESSION ID DISINI
                         snapshot_service.save_fusion_snapshot(track_obj, f0, f1, session_id=self.current_session_id)
@@ -382,7 +384,9 @@ class PipelineService:
                                     'side': None,
                                     'is_fused': False,
                                     'estimated_weight': final_weight,
-                                    'has_snapshot': False
+                                    'has_snapshot': False,
+                                    'class_name': det_top.get('class_name', 'chicken'),
+                                    'score': det_top.get('score', 0.0)
                                 }
                                 # KIRIM SESSION ID DISINI
                                 snapshot_service.save_fusion_snapshot(track_obj, f0, None, session_id=self.current_session_id)

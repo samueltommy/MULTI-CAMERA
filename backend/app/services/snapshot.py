@@ -121,7 +121,8 @@ class SnapshotService:
             if track_data.get('top') and track_data['top'].get('center'):
                 obj.top_center_x = float(track_data['top']['center'][0])
                 obj.top_center_y = float(track_data['top']['center'][1])
-                obj.score = float(track_data['top'].get('score', 0.98))
+                obj.score = float(track_data.get('score', track_data['top'].get('score', 0.98)))
+                obj.class_name = str(track_data.get('class_name', track_data['top'].get('class_name', 'chicken')))
                 
             if track_data.get('side') and track_data['side'].get('bottom_center'):
                 obj.side_center_x = float(track_data['side']['bottom_center'][0])

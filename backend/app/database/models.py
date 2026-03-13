@@ -23,6 +23,7 @@ class FusedObject(Base):
     side_center_y = Column(Float, nullable=True)
     
     class_id = Column(Integer, nullable=True)
+    class_name = Column(String, default="chicken")
     score = Column(Float, nullable=True)
 
     estimated_weight = Column(Float, nullable=True)
