@@ -268,6 +268,8 @@ class PipelineService:
                                 sd['box'] = [int(b[0]*sx), int(b[1]*sy), int(b[2]*sx), int(b[3]*sy)]
                                 if d['center']: sd['center'] = (d['center'][0]*sx, d['center'][1]*sy)
                                 if d['bottom_center']: sd['bottom_center'] = (d['bottom_center'][0]*sx, d['bottom_center'][1]*sy)
+                                if 'mask_area' in d:
+                                    sd['mask_area'] = d['mask_area'] * (sx * sy)
                                 scaled_dets.append(sd)
                             try:
                                 if getattr(settings, 'USE_WORKER_ANNOTATED', False):
@@ -444,10 +446,17 @@ class PipelineService:
                         video_recorder.stop_session()
                         if self.current_session_id:
                             from app.services.statistics import ml_statistics_service
-                            # Menjalankan di thread terpisah agar pipeline tidak berhenti/lag
+                            from tools.cloud_sync import trigger_cloud_sync # <--- IMPORT FUNGSI BARU
+                            
+                            # Jalankan Kalkulasi Statistik & Telemetri Supabase
                             threading.Thread(
                                 target=ml_statistics_service.process_session, 
                                 args=(self.current_session_id,), 
+                                daemon=True
+                            ).start()
+
+                            threading.Thread(
+                                target=trigger_cloud_sync, 
                                 daemon=True
                             ).start()
 
@@ -484,5 +493,28 @@ class PipelineService:
                 print(f"Pipeline error: {e}")
                 traceback.print_exc()
                 time.sleep(0.1)
+
+    def _finalize_session(self, current_session_id):
+        from app.services.statistics import ml_statistics_service
+        from app.services.cloud_telemetry import cloud_telemetry
+        import threading
+        
+        # 1. Hitung statistik dan ambil SELURUH baris data mentah dari DB lokal
+        # Anda perlu memastikan fungsi ini juga mengembalikan list rincian ayam
+        stats, detailed_records = ml_statistics_service.get_full_session_data(current_session_id)
+        
+        if stats:
+            # 2. Tembakkan ke Cloud di background
+            threading.Thread(
+                target=cloud_telemetry.push_full_backup, 
+                args=(
+                    current_session_id, 
+                    stats['age_days'], 
+                    stats['average_weight'], 
+                    stats['total_chickens'],
+                    detailed_records # <--- Kirim array rinciannya ke sini!
+                ), 
+                daemon=True
+            ).start()
 
 pipeline_service = PipelineService()

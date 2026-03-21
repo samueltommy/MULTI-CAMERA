@@ -1,11 +1,16 @@
 import numpy as np
+import cv2
+import json
+from app.database.session import SessionLocal
+from app.database.models import Calibration
 
 class WeightPredictor:
-    def __init__(self, standard_width=1280, standard_height=720):
+    def __init__(self, standard_width=1280, standard_height=720, camera_height_cm=200.0):
         self.standard_width = standard_width
         self.standard_height = standard_height
         
-        self.cm_per_pixel = 0.05
+        # Jarak vertikal lensa kamera atas ke lantai kandang (Penting untuk Optik 2.5D)
+        self.camera_height_cm = camera_height_cm
         
         self.weight_factors = {
             'chicken': 1.0,
@@ -13,26 +18,6 @@ class WeightPredictor:
             'chicken neck': 0.68,
             'chicken wing': 0.51
         }
-
-        self.regions = []
-        grid_rows, grid_cols = 3, 4
-        col_width, row_height = self.standard_width // grid_cols, self.standard_height // grid_rows
-        base_factors = [
-            [1.05, 1.02, 1.02, 1.05], 
-            [1.00, 1.00, 1.00, 1.00], 
-            [0.98, 0.95, 0.95, 0.98]  
-        ]
-        for i in range(grid_rows):
-            for j in range(grid_cols):
-                self.regions.append({
-                    'coords': (j * col_width, i * row_height, (j + 1) * col_width, (i + 1) * row_height),
-                    'factor': base_factors[i][j]
-                })
-
-        self.obstacle_masks = [
-            {'name': 'Pole', 'coords': (250, 435, 530, 1200)},
-            {'name': 'Feeder', 'coords': (730, 170, 910, 320)}
-        ]
 
         # ==========================================================
         # TABEL STANDAR CIOMAS & DYNAMIC OUTLIER LIMITS
@@ -46,113 +31,119 @@ class WeightPredictor:
             35: 2.348
         }
         
-        # Batas Default (Akan ditimpa oleh pipeline sesuai umur)
         self.min_valid_kg = 0.050
         self.max_valid_kg = 3.000
+        
+        # Matriks Kalibrasi Kamera
+        self.H_scale_top = None
+        self.load_calibration()
+
+    def load_calibration(self):
+        """Menarik Matriks Skala Geometri Nyata dari Database"""
+        try:
+            db = SessionLocal()
+            cal = db.query(Calibration).filter(Calibration.is_active == True).order_by(Calibration.created_at.desc()).first()
+            if cal:
+                data = json.loads(cal.matrix_json)
+                if isinstance(data, dict) and data.get('H_scale_top'):
+                    self.H_scale_top = np.array(data['H_scale_top'], dtype=np.float32)
+                    print("[WeightPredictor] Matriks H_scale_top (Geometri Nyata) berhasil dimuat!")
+            db.close()
+        except Exception as e:
+            print(f"[WeightPredictor] Gagal memuat kalibrasi geometri: {e}")
 
     def update_age_limits(self, age_days: int):
-        """Dipanggil oleh pipeline saat sesi dimulai untuk mensetting batas wajar"""
+        """Filter Outlier Cerdas Berdasarkan Umur Ciomas"""
         target_bw = self.ciomas_standard.get(age_days)
         if target_bw is None:
-            if age_days > 35:
-                target_bw = 2.348 + ((age_days - 35) * 0.1)
-            else:
-                target_bw = 0.05
+            if age_days > 35: target_bw = 2.348 + ((age_days - 35) * 0.1)
+            else: target_bw = 0.05
 
-        # DYNAMIC FILTER:
-        # Kita buat sangat longgar agar tidak membuang ayam asli,
-        # tapi cukup ketat untuk membuang kotak deteksi yang error.
-        # Min = 30% dari standar, Max = 180% dari standar
         self.min_valid_kg = max(0.030, target_bw * 0.3)
-        self.max_valid_kg = max(0.800, target_bw * 1.8) # Minimal set ke 800g agar aman
+        self.max_valid_kg = max(0.800, target_bw * 1.8)
         
         print(f"[Weight Predictor] Age: {age_days} Days | Target: {target_bw:.3f} kg")
         print(f"[Weight Predictor] OUTLIER Filter set to: {self.min_valid_kg:.3f} kg - {self.max_valid_kg:.3f} kg")
 
-    def set_scale_ratio(self, ratio):
-        if ratio and ratio > 0:
-            self.cm_per_pixel = ratio
-            print(f"Weight Predictor now using scale: {ratio:.4f} cm/pixel")
+    def _get_real_world_area(self, top_det):
+        """Menghitung Luas Area asli (cm2) yang BEBAS dari Distorsi Perspektif Lensa"""
+        x1, y1, x2, y2 = top_det['box']
+        
+        # Hitung luas kotak bounding box di piksel
+        bbox_area_px = max(1.0, float((x2 - x1) * (y2 - y1)))
+        # Ambil luas tubuh ayam asli (mask) dari YOLO, jika tidak ada, pakai luas kotak
+        mask_area_px = top_det.get('mask_area', bbox_area_px)
+        
+        # Cari rasio (berapa persen kotak tersebut terisi oleh tubuh ayam?)
+        ratio = min(1.0, mask_area_px / bbox_area_px)
+        
+        if self.H_scale_top is None:
+            return (bbox_area_px * (0.05 ** 2)) * ratio
 
-    def is_in_obstacle_zone(self, centroid):
-        cx, cy = centroid
-        for mask in self.obstacle_masks:
-            x1, y1, x2, y2 = mask['coords']
-            if x1 <= cx < x2 and y1 <= cy < y2:
-                return True
-        return False
+        pts_pixel = np.array([
+            [x1, y1], [x2, y1], [x2, y2], [x1, y2]
+        ], dtype=np.float32).reshape(-1, 1, 2)
+        
+        # Proyeksi Piksel ke Dunia Nyata (cm2) untuk kotak
+        pts_cm = cv2.perspectiveTransform(pts_pixel, self.H_scale_top)
+        bbox_area_cm2 = cv2.contourArea(pts_cm)
+        
+        # LUAS ASLI AYAM = Luas kotak dunia nyata dikali persentase kepadatan tubuh
+        true_mask_area_cm2 = bbox_area_cm2 * ratio
+        return true_mask_area_cm2
 
-    def get_region_factor(self, centroid):
-        cx, cy = centroid
-        for region in self.regions:
-            x1, y1, x2, y2 = region['coords']
-            if x1 <= cx < x2 and y1 <= cy < y2:
-                return region['factor']
-        return 1.0
+    def _compensate_z_axis(self, area_cm2, chicken_height_cm):
+        """Kompensasi Optik untuk Metode 2.5D"""
+        H = self.camera_height_cm
+        if chicken_height_cm >= H or chicken_height_cm <= 0: return area_cm2
+        return area_cm2 * (((H - chicken_height_cm) / H) ** 2)
 
     def predict_from_area(self, top_det, class_name, frame_shape):
-        """Algoritma 2D Area"""
+        """Algoritma 2D Area (Baseline)"""
         try:
-            x1, y1, x2, y2 = top_det['box']
-            cx, cy = top_det['center']
+            # Area dihitung dengan Homografi (Piksel miring jadi Lurus)
+            base_area_cm2 = self._get_real_world_area(top_det)
+            if base_area_cm2 < 10.0: return 0.0
             
-            if self.is_in_obstacle_zone((cx, cy)):
-                return -1.0
-            
-            area_px = float((x2 - x1) * (y2 - y1))
-            cm_per_pixel = self.cm_per_pixel if self.cm_per_pixel is not None else 0.05
-            area_cm2 = area_px * (cm_per_pixel ** 2)
-            
-            if area_cm2 < 0.5: return 0.0
-            
+            # Perhitungan 2D Murni
             DENSITY_2D = 3.5
-            base_weight_kg = ((area_cm2 ** 1.5) * DENSITY_2D) / 1000.0
+            base_weight_kg = ((base_area_cm2 ** 1.5) * DENSITY_2D) / 1000.0
             
             factor = self.weight_factors.get(class_name, 1.0)
-            final_weight = base_weight_kg * factor * self.get_region_factor((cx, cy))
+            final_weight = base_weight_kg * factor
             
-            # --- CEK OUTLIER DINAMIS ---
             if final_weight < self.min_valid_kg or final_weight > self.max_valid_kg:
-                return 0.0  # Buang outlier
-
-            # Hapus # di bawah ini jika ingin melihat log 2D
-            # print(f"[DEBUG 2D] ID: {top_det.get('track_id')} | Final: {final_weight:.3f} kg")
+                return 0.0 
+                
             return final_weight
         except Exception as e:
             return 0.0
 
     def predict_from_volume(self, top_det, side_det, class_name, frame_shape):
-        """Algoritma 3D Volume"""
+        """Algoritma 3D Volume (Fusi Top + Side)"""
         try:
-            x1_t, y1_t, x2_t, y2_t = top_det['box']
-            x1_s, y1_s, x2_s, y2_s = side_det['box']
-            cx, cy = top_det['center']
+            base_area_cm2 = self._get_real_world_area(top_det)
             
-            if self.is_in_obstacle_zone((cx, cy)):
-                return -1.0
-                
-            base_area_px = float((x2_t - x1_t) * (y2_t - y1_t))
-            height_px = float(y2_s - y1_s)
+            y1_s, y2_s = side_det['box'][1], side_det['box'][3]
+            chicken_height_px = float(y2_s - y1_s)
+            chicken_height_cm = chicken_height_px * 0.1 # Nanti bisa disesuaikan
             
-            volume_px3 = base_area_px * height_px
-            cm_per_pixel = self.cm_per_pixel if self.cm_per_pixel is not None else 0.05
-            volume_cm3 = volume_px3 * (cm_per_pixel ** 3)
+            # Kompensasi Z-Axis (Metode 2.5D Canggih)
+            true_surface_area_cm2 = self._compensate_z_axis(base_area_cm2, chicken_height_cm)
             
-            if volume_cm3 < 1.0: return 0.0
+            volume_cm3 = true_surface_area_cm2 * chicken_height_cm
+            if volume_cm3 < 10.0: return 0.0
             
             DENSITY_G_PER_CM3 = 2.7 
             base_weight_kg = (volume_cm3 * DENSITY_G_PER_CM3) / 1000.0
             
             factor = self.weight_factors.get(class_name, 1.0)
-            final_weight = base_weight_kg * factor * self.get_region_factor((cx, cy))
+            final_weight = base_weight_kg * factor
             
-            # --- CEK OUTLIER DINAMIS ---
+            # Cek Outlier Ciomas
             if final_weight < self.min_valid_kg or final_weight > self.max_valid_kg:
-                # Print sesekali agar kita tahu kalau ada yg dibuang
-                # print(f"[DEBUG 3D] ID: {top_det.get('track_id')} | OUTLIER DIBUANG: {final_weight:.3f} kg")
                 return 0.0 
             
-            print(f"[DEBUG 3D] ID: {top_det.get('track_id')} | cm3: {volume_cm3:.2f} | Final: {final_weight:.3f} kg")
             return final_weight
         except Exception as e:
             return 0.0

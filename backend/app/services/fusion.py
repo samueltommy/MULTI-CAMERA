@@ -7,6 +7,7 @@ from app.utils.geometry import project_point
 from app.services.snapshot import snapshot_service
 from app.database.session import SessionLocal
 from app.database.models import Calibration
+from app.services.weight_predictor import weight_predictor
 
 class FusionService:
     def __init__(self):
@@ -21,49 +22,48 @@ class FusionService:
             db = SessionLocal()
             cal = db.query(Calibration).filter(Calibration.is_active == True).order_by(Calibration.created_at.desc()).first()
             if cal:
-                self.H = np.array(json.loads(cal.matrix_json))
+                data = json.loads(cal.matrix_json)
+                
+                # Cek apakah ini format baru (Dictionary) atau format lama (List Array)
+                if isinstance(data, dict):
+                    self.H = np.array(data.get('H_fusion'), dtype=np.float32) if data.get('H_fusion') else None
+                else:
+                    self.H = np.array(data, dtype=np.float32)
+                    
                 print(f"Loaded homography from DB (ID: {cal.id})")
-                db.close()
-                return
+            else:
+                self.H = None
+                print("No active homography found in DB.")
             db.close()
-            print("No active homography found in DB.")
         except Exception as e:
             print(f"Failed to load homography from DB: {e}")
-        
-        self.H = None
+            self.H = None
 
-    def set_homography(self, H, name="Manual Calibration"):
-        self.H = H
+    def set_homography(self, H_data, name="Manual Calibration"):
+        # H_data sekarang bisa menerima dictionary dari API
+        if isinstance(H_data, dict):
+            self.H = np.array(H_data.get('H_fusion'), dtype=np.float32) if H_data.get('H_fusion') else None
+        else:
+            self.H = H_data
+            H_data = H_data.tolist() if hasattr(H_data, 'tolist') else H_data
         
         try:
             db = SessionLocal()
-            
-            # 1. Siapkan string JSON untuk perbandingan
-            new_matrix_str = json.dumps(H.tolist())
-            
-            # 2. Cek kalibrasi aktif terakhir
-            last_active = db.query(Calibration).filter(Calibration.is_active == True).order_by(Calibration.created_at.desc()).first()
-            
-            # 3. Jika matriks SAMA PERSIS dengan yang aktif, JANGAN simpan baru
-            if last_active and last_active.matrix_json == new_matrix_str:
-                print(f"Homography identical to active one (ID: {last_active.id}). Skipping DB save.")
-                db.close()
-                return # KELUAR, tidak melakukan insert
-
-            # 4. Jika BEDA, nonaktifkan yang lama dan simpan yang baru
             db.query(Calibration).update({Calibration.is_active: False})
-            
             new_cal = Calibration(
                 name=name,
-                matrix_json=new_matrix_str, # Gunakan string yang sudah digenerate
+                matrix_json=json.dumps(H_data),
                 is_active=True
             )
             db.add(new_cal)
             db.commit()
             print(f"Saved new homography to DB (ID: {new_cal.id})")
             db.close()
+
+            weight_predictor.load_calibration()
+
         except Exception as e:
-            print(f"Failed to save homography to DB: {e}")
+            print(f"Failed to save homography: {e}")
 
     def match_detections(self, dets_top, dets_side):
         matches = []
