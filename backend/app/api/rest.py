@@ -1,4 +1,4 @@
-from flask import Blueprint, jsonify, request, send_from_directory, render_template, current_app
+from flask import Blueprint, jsonify, request, send_from_directory, render_template, current_app, Response
 from app.services.fusion import fusion_service
 from app.services.pipeline import pipeline_service
 from app.services.calibration import calibration_service
@@ -7,9 +7,11 @@ from app.core.config import settings
 from app.database.session import SessionLocal
 from app.database.models import FusedObject
 from app.database.models import DailyStat, FarmSettings
+from app.services.camera import camera_manager
 from sqlalchemy import desc
 import numpy as np
 import os
+import cv2
 import time
 from datetime import datetime, date, timedelta
 
@@ -58,84 +60,78 @@ def trigger_status():
 def ice_config():
     # Provide ICE servers (STUN/TURN) to clients.
     ice = [{'urls': settings.STUN_URL}]
-    # Add TURN if needed/available in settings later
     return jsonify({ 'iceServers': ice })
 
 @api.route('/webrtc')
 def webrtc_page():
     return render_template('webrtc.html')
 
-@api.route('/calibrate')
-def calibrate_page():
-    return render_template('calibrate.html')
-
 @api.route('/gallery')
 def gallery_page():
     return render_template('gallery.html')
 
-@api.route('/calibrate/reset', methods=['POST'])
-def calibrate_reset():
-    calibration_service.reset()
-    return jsonify({'ok': True})
 
-@api.route('/calibrate/capture', methods=['POST'])
-def calibrate_capture():
+# =========================================================================
+# CALIBRATION ENDPOINTS (Diperbarui untuk React Calibration Modal)
+# =========================================================================
+
+@api.route('/api/calibration/stream/<int:cam_idx>')
+def calibration_stream(cam_idx):
+    """Stream MJPEG khusus untuk pop-up kalibrasi dengan overlay kotak ArUco"""
+    def generate():
+        while True:
+            frame, _ = camera_manager.get_raw_frame(cam_idx)
+            if frame is not None:
+                # Copy frame agar tidak merusak frame utama pipeline
+                display_frame = frame.copy()
+                
+                # Coba deteksi ArUco di frame ini
+                corners, ids, _ = calibration_service.detector.detectMarkers(display_frame)
+                
+                # Jika terdeteksi, gambar kotak dan ID-nya secara real-time!
+                if ids is not None:
+                    cv2.aruco.drawDetectedMarkers(display_frame, corners, ids)
+                    # Tambahkan teks panduan di layar
+                    cv2.putText(display_frame, f"ARUCO DETECTED: {len(ids)}", (20, 40), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                else:
+                    cv2.putText(display_frame, "SEARCHING FOR ARUCO...", (20, 40), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                
+                # Encode ke JPEG untuk dikirim ke browser
+                ret, buffer = cv2.imencode('.jpg', display_frame)
+                if ret:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            
+            # Batasi FPS sekitar 20fps agar Edge Node tidak keberatan beban
+            time.sleep(0.05) 
+            
+    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@api.route('/api/calibration/capture', methods=['POST'])
+def calibration_capture():
+    """Menangkap titik sudut ArUco dari kedua kamera."""
     success, msg = calibration_service.capture_points()
-    if success:
-        return jsonify({'ok': True, 'message': msg, 'count': len(calibration_service.src_pts)})
-    else:
-        return jsonify({'ok': False, 'error': msg}), 400
+    return jsonify({'success': success, 'message': msg})
 
-@api.route('/calibrate/finish', methods=['POST'])
-def calibrate_finish():
+@api.route('/api/calibration/save', methods=['POST'])
+def calibration_save():
+    """Menghitung matriks 2.5D dan menyimpannya ke database."""
     data = request.get_json() or {}
-    name = data.get('name')
+    name = data.get('name', 'Web Auto-Calib')
     success, msg = calibration_service.compute_and_save(name=name)
-    if success:
-        return jsonify({'ok': True, 'message': msg})
-    else:
-        return jsonify({'ok': False, 'error': msg}), 400
+    return jsonify({'success': success, 'message': msg})
 
-@api.route('/calibrate/compute', methods=['POST'])
-def calibrate_compute():
-    try:
-        data = request.get_json()
-        src = data.get('src')
-        dst = data.get('dst')
-        name = data.get('name', 'Manual Calibration')
-        if not src or not dst:
-            return jsonify({'error': 'invalid points'}), 400
-        
-        from app.utils.geometry import compute_homography
-        H, status = compute_homography(src, dst)
-        if H is None:
-             return jsonify({'error': 'failed'}), 500
-        
-        fusion_service.set_homography(H, name=name)
-        return jsonify({'ok': True})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-@api.route('/calibrate/identity', methods=['POST'])
-def calibrate_identity():
-    """Explicitly set an identity homography.
-
-    This is useful when the two camera feeds are actually the same video
-    (e.g. you are testing with a duplicated source).  With an identity
-    matrix every point projects to itself and the fusion logic treats the
-    two streams as perfectly overlapping.  The endpoint simply writes the
-    3x3 identity into the database via :class:`FusionService`.
-    """
-    try:
-        H = np.eye(3, dtype=np.float32)
-        fusion_service.set_homography(H, name="Identity (same video)")
-        return jsonify({'ok': True})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+@api.route('/api/calibration/reset', methods=['POST'])
+def calibration_reset():
+    """Mereset tangkapan titik (jika pengguna ingin membatalkan)."""
+    calibration_service.reset()
+    return jsonify({'success': True, 'message': 'Tangkapan kamera di-reset.'})
 
 @api.route('/calibrate/history')
 def calibrate_history():
+    """Melihat riwayat kalibrasi di database."""
     from app.database.session import SessionLocal
     from app.database.models import Calibration
     db = SessionLocal()
@@ -144,31 +140,17 @@ def calibrate_history():
     db.close()
     return jsonify({'history': out})
 
-@api.route('/calibrate/auto', methods=['POST'])
-def calibrate_auto():
-    try:
-        from tools.auto_calibrate import auto_calibrate
-        required = int(request.json.get('points', os.environ.get('CALIBRATION_POINTS', 5)))
-        # We run this in a headless way if called from API to avoid window issues on server
-        success = auto_calibrate(required_points=required, headless=True)
-        if success:
-            fusion_service.load_homography()
-            return jsonify({'ok': True, 'message': 'Auto-calibration finished'})
-        else:
-            return jsonify({'error': 'Calibration failed or no markers found'}), 500
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
 @api.route('/calibrate/activate/<int:cal_id>', methods=['POST'])
 def calibrate_activate(cal_id):
+    """Mengaktifkan kembali kalibrasi lama dari riwayat."""
     from app.database.session import SessionLocal
     from app.database.models import Calibration
     try:
         db = SessionLocal()
-        # Deactivate all
+        # Nonaktifkan semua
         db.query(Calibration).update({Calibration.is_active: False})
         
-        # Activate specific
+        # Aktifkan yang dipilih
         cal = db.query(Calibration).filter(Calibration.id == cal_id).first()
         if not cal:
             db.close()
@@ -178,18 +160,32 @@ def calibrate_activate(cal_id):
         db.commit()
         db.close()
         
-        # Reload in service
+        # Minta Fusion Service dan Weight Predictor memuat ulang matriks
         fusion_service.load_homography()
+        from app.services.weight_predictor import weight_predictor
+        weight_predictor.load_calibration()
         
         return jsonify({'ok': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@api.route('/calibrate/identity', methods=['POST'])
+def calibrate_identity():
+    """Fallback Darurat: Memaksa matriks Identity (Anggap Kamera 1 & 2 persis sama)"""
+    try:
+        H = np.eye(3, dtype=np.float32)
+        fusion_service.set_homography(H, name="Identity (same video)")
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# =========================================================================
+
+
 @api.route('/fused')
 def fused_list():
     out = []
     for ft in fusion_service.fused_tracks:
-        # Frontend expects 'snaps' to be a list of objects {top:..., side:...}
         snaps_list = []
         paths = ft.get('snapshot_paths')
         if paths:
@@ -207,23 +203,17 @@ def fused_list():
 
 @api.route('/snapshots/<path:filename>')
 def snapshot_file(filename):
-    # Resolve relative path to absolute
     snapshot_dir = os.path.abspath(settings.SNAPSHOT_DIR)
     return send_from_directory(snapshot_dir, filename)
 
 @api.route('/streams')
 def streams():
-    # Basic metrics placeholder
     return jsonify({
         'outputs': {'cam1': settings.OUTPUT_URL_1, 'cam2': settings.OUTPUT_URL_2}
     })
 
 @api.route('/object_details', methods=['GET'])
 def get_object_details():
-    """
-    Mengambil detail lengkap (Foto Top/Side, Berat) untuk satu ID ayam.
-    Dipanggil saat user mengklik baris di tabel kiri.
-    """
     track_id = request.args.get('track_id')
     session_id = request.args.get('session_id')
     
@@ -236,7 +226,6 @@ def get_object_details():
         if session_id:
             query = query.filter(FusedObject.session_id == session_id)
             
-        # Ambil data paling update (terakhir direkam)
         obj = query.order_by(desc(FusedObject.created_at)).first()
         
         if not obj:
@@ -244,8 +233,7 @@ def get_object_details():
             
         data = obj.to_dict()
         
-        # Generate URL Gambar untuk Frontend
-        host_url = request.host_url.rstrip('/') # http://localhost:5000
+        host_url = request.host_url.rstrip('/') 
         
         if data.get('snapshot_top'):
             data['image_url_top'] = f"{host_url}/snapshots/{data['snapshot_top']}"
@@ -263,21 +251,15 @@ def get_object_details():
     finally:
         db.close()
 
-# --- BARU: List Semua Sesi ---
 @api.route('/sessions', methods=['GET'])
 def get_sessions():
-    """Mengambil daftar semua Session ID yang ada di database."""
     db = SessionLocal()
     try:
-        # Ambil session_id yang unik
         sessions = db.query(FusedObject.session_id)\
                      .filter(FusedObject.session_id.isnot(None))\
                      .distinct().all()
         
-        # Convert list of tuples ke list of strings
         session_list = [s[0] for s in sessions]
-        
-        # Urutkan dari yang terbaru (Descending)
         session_list.sort(reverse=True)
         
         return jsonify({
@@ -287,31 +269,23 @@ def get_sessions():
     finally:
         db.close()
 
-# --- BARU: List Objek untuk Tabel Kiri ---
 @api.route('/session_objects', methods=['GET'])
 def get_session_objects():
-    """
-    Mengambil daftar ID ayam dan berat terakhirnya dalam satu sesi.
-    Output urut dari ID terkecil ke terbesar.
-    """
     session_id = request.args.get('session_id')
     
-    # Jika parameter kosong, gunakan sesi yang sedang berjalan (jika ada)
     if not session_id:
         session_id = pipeline_service.current_session_id
         
     if not session_id:
-        return jsonify([]) # Tidak ada sesi aktif
+        return jsonify([]) 
 
     db = SessionLocal()
     try:
-        # Ambil semua data pada sesi ini, urutkan dari yang terbaru
         rows = db.query(FusedObject)\
                  .filter(FusedObject.session_id == session_id)\
                  .order_by(desc(FusedObject.created_at))\
                  .all()
         
-        # Filter: Hanya ambil data TERBARU untuk setiap track_id
         unique_map = {}
         for row in rows:
             if row.track_id not in unique_map:
@@ -321,11 +295,7 @@ def get_session_objects():
                     "last_seen": row.created_at.isoformat() if row.created_at else None
                 }
         
-        # Ubah ke list
         result = list(unique_map.values())
-        
-        # SORTING: Urutkan berdasarkan ID Terkecil (Ascending)
-        # Ini memudahkan frontend untuk auto-select index[0]
         result.sort(key=lambda x: x['track_id'])
         
         return jsonify(result)
@@ -351,8 +321,6 @@ def handle_farm_settings():
                 settings.chick_in_date = datetime.strptime(data['chick_in_date'], '%Y-%m-%d').date() if data['chick_in_date'] else None
             if 'manual_age_override' in data:
                 settings.manual_age_override = data['manual_age_override'] if data['manual_age_override'] != "" else None
-            
-            # TAMBAHAN UNTUK TARGET PANEN
             if 'target_harvest_weight_kg' in data:
                 settings.target_harvest_weight_kg = float(data['target_harvest_weight_kg'])
                 
@@ -365,17 +333,14 @@ def handle_farm_settings():
 
 @api.route('/daily_statistics', methods=['GET'])
 def get_daily_statistics():
-    """Mengambil hasil kalkulasi AI harian (sangat cepat karena sudah di-precompute)"""
     db = SessionLocal()
     try:
-        # Cek parameter tanggal, jika tidak ada, gunakan hari ini
         date_str = request.args.get('date')
         if date_str:
             target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
         else:
             target_date = date.today()
 
-        # Langsung ambil data yang sudah dihitung oleh statistics.py
         stat = db.query(DailyStat).filter(DailyStat.date == target_date).first()
 
         if not stat:
@@ -398,11 +363,9 @@ def get_daily_statistics():
 def get_harvest_prediction():
     db = SessionLocal()
     try:
-        # A. Ambil setting Target Berat dari Database
         settings = db.query(FarmSettings).first()
         target_weight = settings.target_harvest_weight_kg if settings else 2.0
         
-        # B. Ambil Berat Rata-rata Harian Terkini (Hasil dari Isolation Forest ML)
         today = date.today()
         daily_stat = db.query(DailyStat).filter(DailyStat.date == today).first()
         
@@ -413,11 +376,8 @@ def get_harvest_prediction():
             })
             
         current_weight = daily_stat.daily_average_kg
-        
-        # C. Minta AI (Polynomial ML) menghitung prediksi waktunya
         prediction = growth_predictor.predict_harvest(current_weight, target_weight)
         
-        # D. Gabungkan info tambahan (opsional)
         if settings and settings.chick_in_date:
             calendar_age = (today - settings.chick_in_date).days
             prediction["calendar_age_days"] = max(0, calendar_age)
@@ -434,13 +394,10 @@ def get_harvest_prediction():
 
 @api.route('/growth_chart', methods=['GET'])
 def get_growth_chart():
-    """API untuk mengirim data grafik perbandingan AI vs Standar Ciomas (Default 40 Hari)"""
     db = SessionLocal()
     try:
-        # 1. Ambil tanggal chick-in
         settings = db.query(FarmSettings).first()
         
-        # Peringatan ramah jika tanggal belum diatur (Menghindari Error 400)
         if not settings or not settings.chick_in_date:
             return jsonify({
                 "status": "error", 
@@ -448,18 +405,14 @@ def get_growth_chart():
             }), 200
 
         chick_in = settings.chick_in_date
-        
-        # 2. Ambil riwayat akumulasi harian dari AI
         daily_stats = db.query(DailyStat).all()
         
-        # Buat pemetaan (dictionary) data aktual berdasarkan umurnya
         actual_data_map = {}
         for stat in daily_stats:
             age_days = (stat.date - chick_in).days
             if age_days >= 0:
                 actual_data_map[age_days] = stat.daily_average_kg
         
-        # 3. Kamus Standar Ciomas
         ciomas_standard = {
             0: 0.042, 1: 0.056, 2: 0.073, 3: 0.094, 4: 0.118, 5: 0.145, 6: 0.176,
             7: 0.210, 8: 0.247, 9: 0.288, 10: 0.332, 11: 0.379, 12: 0.429, 13: 0.483,
@@ -471,21 +424,16 @@ def get_growth_chart():
 
         chart_data = []
         
-        # 4. LOOPING MEMAKSA RENTANG 0 SAMPAI 40 HARI
         for age_days in range(41):
-            # Ambil target ciomas (jika > 35 hari, ekstrapolasi tambah 100g/hari)
             target_bw = ciomas_standard.get(age_days)
             if target_bw is None:
                  target_bw = 2.348 + ((age_days - 35) * 0.1)
 
-            # Hitung tanggal jatuhnya hari tersebut
             current_date = chick_in + timedelta(days=age_days)
 
-            # Masukkan ke format data grafik
             chart_data.append({
                 "date": current_date.strftime("%d %b"),
                 "age_days": age_days,
-                # Jika hari ini ada data kamera, masukkan. Jika belum/tidak ada, kirim None (null)
                 "actual_weight_kg": round(actual_data_map[age_days], 3) if age_days in actual_data_map else None,
                 "target_weight_kg": round(target_bw, 3)
             })

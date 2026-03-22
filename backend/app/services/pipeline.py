@@ -9,6 +9,7 @@ from app.services.camera import camera_manager
 from app.services.inference import InferenceManager
 from app.services.fusion import fusion_service
 from app.services.video_recorder import video_recorder
+from app.utils.latency_tracker import LatencyTracker
 
 class PipelineService:
     def __init__(self):
@@ -21,7 +22,6 @@ class PipelineService:
         self.raw_detection_ts = [0.0, 0.0]
         self.session_active = False
         self.session_end_time = 0.0
-        # Variabel baru untuk menyimpan ID sesi saat ini (folder name)
         self.current_session_id = None 
         
         self.best_session_result = {
@@ -38,6 +38,10 @@ class PipelineService:
         self._last_draw_n = [0, 0]
         self._inference_skip_frames = getattr(settings, 'INFERENCE_SKIP_FRAMES', 1)
         self._frame_counter = [0, 0]
+        
+        # Variabel Tracker Latensi
+        self.latency_logger = None
+        self.latency_frame_counter = 0
 
     def _get_smart_weight(self, obj_id, current_center, raw_weight):
         # (Logika smart weight sama seperti sebelumnya, tidak berubah)
@@ -82,9 +86,12 @@ class PipelineService:
         self.session_end_time = time.time() + duration
         self.session_active = True
         
-        # =================================================================
-        # TAMBAHAN: UPDATE BATAS OUTLIER BERDASARKAN UMUR AYAM HARI INI
-        # =================================================================
+        # -------------------------------------------------------------
+        # INISIASI LATENCY TRACKER
+        self.latency_logger = LatencyTracker(self.current_session_id)
+        self.latency_frame_counter = 0
+        # -------------------------------------------------------------
+        
         from app.database.session import SessionLocal
         from app.database.models import FarmSettings
         from datetime import date
@@ -101,21 +108,23 @@ class PipelineService:
                     delta = date.today() - settings_db.chick_in_date
                     age_days = max(0, delta.days)
             
-            # Kirim umur ke predictor agar batas outliernya disesuaikan
             weight_predictor.update_age_limits(age_days)
         except Exception as e:
             print(f"[Pipeline] Error setting dynamic outlier: {e}")
         finally:
             db.close()
-        # =================================================================
 
         video_recorder.start_session(fps=settings.MOTION_HIGH_FPS)
 
     def stop_session(self):
         self.session_active = False
-        # self.current_session_id = None # Opsional: reset atau biarkan
         print("Session force stopped")
         video_recorder.stop_session()
+        
+        # Tutup file CSV Latensi jika diberhentikan paksa
+        if self.latency_logger:
+            self.latency_logger.close()
+            self.latency_logger = None
 
         if self.current_session_id:
             from app.services.statistics import ml_statistics_service
@@ -125,7 +134,6 @@ class PipelineService:
                 daemon=True
             ).start()
 
-    # ... (Method start, stop, mark_started_on_demand, enable_inference, _draw_detections SAMA SEPERTI SEBELUMNYA) ...
     def start(self, inference_enabled=False):
         self.enable_inference(inference_enabled)
         self.running = True
@@ -186,10 +194,17 @@ class PipelineService:
         
         while self.running:
             try:
+                # ==========================================
+                # TIMER: TOTAL PIPELINE
                 t0 = time.time()
-                # 1. Get Frames
+                t_pipeline_start = time.perf_counter()
+                
+                # ==========================================
+                # TIMER: RTSP CAPTURE
+                t_cap_start = time.perf_counter()
                 f0, ts0 = camera_manager.get_raw_frame(0)
                 f1, ts1 = camera_manager.get_raw_frame(1)
+                t_capture = time.perf_counter() - t_cap_start
                 
                 if f0 is None and f1 is None:
                     time.sleep(0.01)
@@ -211,6 +226,10 @@ class PipelineService:
 
                 target_fps = settings.MOTION_HIGH_FPS if (motion_present or self.session_active) else settings.MOTION_LOW_FPS
                 tick_interval = 1.0 / target_fps
+                
+                # ==========================================
+                # TIMER: INFERENCE (KIRIM + AMBIL HASIL YOLO)
+                t_infer_start = time.perf_counter()
                 
                 # 3. Inference Sending
                 if self.inference_enabled and self.inference_manager:
@@ -242,7 +261,7 @@ class PipelineService:
                 except Exception:
                     pass
 
-                # Handle Inference Results (Scaling, Hold logic, etc.)
+                # Handle Inference Results
                 worker_annotated_frames = [None, None]
                 if self.inference_enabled:
                     for res in results:
@@ -307,10 +326,13 @@ class PipelineService:
                                     self._last_nonzero_ts[cam] = time.time()
                         except Exception:
                             pass
+                            
+                t_infer = time.perf_counter() - t_infer_start
 
-                # ==============================================================================
-                # 6. Fusion & WEIGHT PREDICTION (SMART LOGIC & SESSION ID)
-                # ==============================================================================
+                # ==========================================
+                # TIMER: FUSION & GEOMETRY
+                t_fuse_start = time.perf_counter()
+
                 current_fused = []
                 fused_top_centers = [] 
                 
@@ -348,7 +370,6 @@ class PipelineService:
                             'class_name': fo['top'].get('class_name', 'chicken'),
                             'score': fo['top'].get('score', 0.0)
                         }
-                        # KIRIM SESSION ID DISINI
                         snapshot_service.save_fusion_snapshot(track_obj, f0, f1, session_id=self.current_session_id)
                         
                         fo['top']['weight'] = final_weight
@@ -390,9 +411,10 @@ class PipelineService:
                                     'class_name': det_top.get('class_name', 'chicken'),
                                     'score': det_top.get('score', 0.0)
                                 }
-                                # KIRIM SESSION ID DISINI
                                 snapshot_service.save_fusion_snapshot(track_obj, f0, None, session_id=self.current_session_id)
                                 det_top['weight'] = final_weight
+
+                t_fuse = time.perf_counter() - t_fuse_start
 
                 # ==============================================================================
                 # 5. GENERATE ANNOTATED FRAMES
@@ -417,7 +439,7 @@ class PipelineService:
                             frame_ann = self._draw_detections(raw_frames[i], self.raw_detections[i])
 
                         annotated_frames[i] = frame_ann
-
+                        
                         if frame_ann is not None:
                             if current_fused:
                                 if i == 0:
@@ -444,11 +466,16 @@ class PipelineService:
                         self.session_active = False
                         print(f"Session finished. Best count: {self.best_session_result['count']}")
                         video_recorder.stop_session()
+                        
+                        # Tutup dan Flush CSV Latensi ketika sesi habis
+                        if self.latency_logger:
+                            self.latency_logger.close()
+                            self.latency_logger = None
+
                         if self.current_session_id:
                             from app.services.statistics import ml_statistics_service
-                            from tools.cloud_sync import trigger_cloud_sync # <--- IMPORT FUNGSI BARU
+                            from tools.cloud_sync import trigger_cloud_sync 
                             
-                            # Jalankan Kalkulasi Statistik & Telemetri Supabase
                             threading.Thread(
                                 target=ml_statistics_service.process_session, 
                                 args=(self.current_session_id,), 
@@ -486,7 +513,22 @@ class PipelineService:
                                 {d.get('track_id') for d in self.raw_detections[1]}
                     self.object_stats = {tid: s for tid, s in self.object_stats.items() if tid in active_ids}
                 
-                elapsed = time.time() - t0
+                # ==========================================
+                # REKAM DATA LATENSI KE CSV JIKA SESI AKTIF
+                t_pipeline_total = time.perf_counter() - t_pipeline_start
+                
+                if self.session_active and self.latency_logger:
+                    self.latency_frame_counter += 1
+                    self.latency_logger.record_frame(
+                        self.latency_frame_counter, 
+                        t_capture, 
+                        t_infer, 
+                        t_fuse, 
+                        t_pipeline_total
+                    )
+                # ==========================================
+
+                elapsed = time.perf_counter() - t_pipeline_start
                 to_sleep = max(0.0, tick_interval - elapsed)
                 time.sleep(to_sleep)
             except Exception as e:
@@ -499,12 +541,9 @@ class PipelineService:
         from app.services.cloud_telemetry import cloud_telemetry
         import threading
         
-        # 1. Hitung statistik dan ambil SELURUH baris data mentah dari DB lokal
-        # Anda perlu memastikan fungsi ini juga mengembalikan list rincian ayam
         stats, detailed_records = ml_statistics_service.get_full_session_data(current_session_id)
         
         if stats:
-            # 2. Tembakkan ke Cloud di background
             threading.Thread(
                 target=cloud_telemetry.push_full_backup, 
                 args=(
@@ -512,7 +551,7 @@ class PipelineService:
                     stats['age_days'], 
                     stats['average_weight'], 
                     stats['total_chickens'],
-                    detailed_records # <--- Kirim array rinciannya ke sini!
+                    detailed_records
                 ), 
                 daemon=True
             ).start()
