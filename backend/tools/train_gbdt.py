@@ -37,15 +37,62 @@ def turn_outliers_to_nan(df, column):
         
     return df
 
+# --- FUNGSI BARU UNTUK MELATIH MODEL AGAR TIDAK MENULIS KODE 2 KALI ---
+def train_and_save_model(X, y, model_filename, step_label):
+    print(f"\n{step_label} Melatih model XGBoost Regressor ({model_filename})...")
+    
+    # Menggunakan random_state=42 agar data latih dan data uji SAMA PERSIS untuk 2D dan 3D
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    model = XGBRegressor(
+        n_estimators=200,      
+        learning_rate=0.05,    
+        max_depth=5,           
+        subsample=0.8,         
+        colsample_bytree=0.8,
+        random_state=42
+    )
+    
+    model.fit(X_train, y_train)
+
+    print(f"Mengevaluasi Performa Model {model_filename}...")
+    y_pred = model.predict(X_test)
+    
+    mae = mean_absolute_error(y_test, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    r2 = r2_score(y_test, y_pred)
+
+    print("=" * 60)
+    print(f"📊 HASIL EVALUASI {model_filename} (PADA 20% DATA UJI):")
+    print(f"  - MAE  (Rata-rata error absolut)  : {mae*1000:.1f} Gram")
+    print(f"  - RMSE (Standar deviasi akurasi)  : {rmse*1000:.1f} Gram")
+    print(f"  - R²   (Kecocokan Model Prediksi) : {r2*100:.2f} %")
+    print("=" * 60)
+
+    # Simpan Model dan Nama Kolom Fitur
+    model_dir = os.path.join(parent_dir, 'app', 'models')
+    os.makedirs(model_dir, exist_ok=True)
+    
+    artifact = {
+        'model': model,
+        'features': list(X.columns) # Disimpan agar urutan kolom konsisten saat live prediction
+    }
+    
+    save_path = os.path.join(model_dir, model_filename)
+    joblib.dump(artifact, save_path)
+    print(f"✅ Model berhasil disimpan dengan nama: {model_filename}")
+    print(f"✅ Lokasi: {save_path}")
+
+
 def train_model():
     print("="*60)
-    print("🚀 MEMULAI PROSES TRAINING GBDT (DENGAN KNN IMPUTATION)")
+    print("🚀 MEMULAI PROSES TRAINING GBDT (DUAL MODEL: 3D vs 2D)")
     print("="*60)
 
     db = SessionLocal()
     try:
         # =========================================================
-        # 1. DATA INGESTION (Tarik Data Timbangan Asli)
+        # 1. DATA INGESTION
         # =========================================================
         print("[1/6] Mengambil dataset dari PostgreSQL...")
         query = db.query(FusedObject).filter(
@@ -66,22 +113,17 @@ def train_model():
         # =========================================================
         print("\n[2/6] Melakukan Data Cleansing & Deteksi Anomali...")
         
-        # A. Batas Logis Sensor (Buang error sensor parah)
-        df = df[(df['mask_area_px'] > 50) | (df['mask_area_px'].isnull())] # Luas piksel tidak mungkin 0
-        df.loc[df['score'] < 0.1, 'score'] = 0.1 # Batasi skor konfidensi minimum 10%
+        df = df[(df['mask_area_px'] > 50) | (df['mask_area_px'].isnull())]
+        df.loc[df['score'] < 0.1, 'score'] = 0.1
         df.loc[df['score'] > 1.0, 'score'] = 1.0 
         
-        # Isi kategori teks yang kosong dengan default 'chicken'
         df['class_name'] = df['class_name'].fillna('chicken')
 
-        # B. Deteksi Outlier Sensor -> Ubah ke NaN
         df = turn_outliers_to_nan(df, 'mask_area_px')
         df = turn_outliers_to_nan(df, 'bbox_width_px')
         if 'bbox_height_px' in df.columns:
             df = turn_outliers_to_nan(df, 'bbox_height_px')
 
-        # C. Filter Outlier Human Error (Berat Asli)
-        # Jika peternak salah ketik berat manual (misal 15000 gram padahal harusnya 1500), DIBUANG.
         Q1_y = df['actual_weight_gram'].quantile(0.25)
         Q3_y = df['actual_weight_gram'].quantile(0.75)
         IQR_y = Q3_y - Q1_y
@@ -97,87 +139,45 @@ def train_model():
         # =========================================================
         print("\n[3/6] Merekonstruksi data sensor yang rusak menggunakan KNN...")
         
-        # Pilih HANYA kolom angka untuk KNN Imputer
         numeric_cols_for_knn = [
             'mask_area_px', 'bbox_width_px', 'bbox_height_px', 
             'score', 'age_days', 'actual_weight_gram'
         ]
         
-        # Pastikan kolom-kolom tersebut bertipe numerik float
         for col in numeric_cols_for_knn:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
         
         imputer = KNNImputer(n_neighbors=5, weights='distance')
-        
-        # Lakukan rekonstruksi pada kolom numerik
         df_imputed_numeric = imputer.fit_transform(df[numeric_cols_for_knn])
         df[numeric_cols_for_knn] = df_imputed_numeric
         
         print(f"✅ Rekonstruksi selesai. Semua nilai NaN berhasil ditambal secara matematis.")
 
         # =========================================================
-        # 4. FEATURE ENGINEERING
+        # 4. FEATURE ENGINEERING UTAMA
         # =========================================================
-        print("\n[4/6] Mempersiapkan Fitur (X) dan Target (y)...")
-        features = ['mask_area_px', 'bbox_width_px', 'bbox_height_px', 'score', 'age_days', 'is_fused', 'class_name']
+        print("\n[4/6] Mempersiapkan Fitur Dasar (X) dan Target (y)...")
+        features = ['mask_area_px', 'bbox_width_px', 'bbox_height_px', 'score', 'age_days', 'class_name']
         
-        X = df[features].copy()
+        X_base = df[features].copy()
+        X_base = pd.get_dummies(X_base, columns=['class_name'], drop_first=False)
         
-        # Ubah variabel kategori ('chicken wing', dll) menjadi angka biner (One-Hot Encoding)
-        X = pd.get_dummies(X, columns=['class_name'], drop_first=False)
-        
-        # Target (y) diubah ke satuan Kilogram (kg)
         y = df['actual_weight_gram'] / 1000.0 
 
         # =========================================================
-        # 5. TRAINING MODEL (XGBOOST)
+        # 5. TRAINING MODEL 3D (FUSI)
         # =========================================================
-        print("\n[5/6] Melatih model XGBoost Regressor (Tree-Based)...")
-        
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-        model = XGBRegressor(
-            n_estimators=200,      
-            learning_rate=0.05,    
-            max_depth=5,           
-            subsample=0.8,         
-            colsample_bytree=0.8,
-            random_state=42
-        )
-        
-        model.fit(X_train, y_train)
+        # Menggunakan semua fitur, termasuk bbox_height_px
+        X_3d = X_base.copy()
+        train_and_save_model(X_3d, y, "gbdt_3d_model.pkl", "[5/6]")
 
         # =========================================================
-        # 6. EVALUASI DAN PENYIMPANAN MODEL
+        # 6. TRAINING MODEL 2D (ABLATION/BASELINE)
         # =========================================================
-        print("\n[6/6] Mengevaluasi Performa Model...")
-        y_pred = model.predict(X_test)
-        
-        mae = mean_absolute_error(y_test, y_pred)
-        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-        r2 = r2_score(y_test, y_pred)
-
-        print("=" * 60)
-        print("📊 HASIL EVALUASI GBDT (PADA 20% DATA UJI/TEST SET):")
-        print(f"  - MAE  (Rata-rata error absolut)  : {mae*1000:.1f} Gram")
-        print(f"  - RMSE (Standar deviasi akurasi)  : {rmse*1000:.1f} Gram")
-        print(f"  - R²   (Kecocokan Model Prediksi) : {r2*100:.2f} %")
-        print("=" * 60)
-
-        # Simpan Model dan Nama Kolom Fitur (Penting!)
-        model_dir = os.path.join(parent_dir, 'app', 'models')
-        os.makedirs(model_dir, exist_ok=True)
-        
-        artifact = {
-            'model': model,
-            'features': list(X.columns) # Disimpan agar urutan kolom konsisten saat live prediction
-        }
-        
-        save_path = os.path.join(model_dir, 'best_gbdt_model.pkl')
-        joblib.dump(artifact, save_path)
-        print(f"\n✅ Model berhasil disimpan dengan nama: best_gbdt_model.pkl")
-        print(f"✅ Lokasi: {save_path}")
+        # Membuang fitur tinggi/kamera samping agar model menebak layaknya sistem 2D
+        X_2d = X_base.copy().drop(columns=['bbox_height_px'])
+        train_and_save_model(X_2d, y, "gbdt_2d_model.pkl", "[6/6]")
 
     except Exception as e:
         print(f"\n❌ Terjadi kesalahan saat proses MLOps: {e}")
