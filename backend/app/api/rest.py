@@ -118,7 +118,8 @@ def calibration_capture():
 @api.route('/api/calibration/save', methods=['POST'])
 def calibration_save():
     """Menghitung matriks 2.5D dan menyimpannya ke database."""
-    data = request.get_json() or {}
+    # PERBAIKAN: Tambahkan silent=True agar tidak Error 415 jika header hilang
+    data = request.get_json(silent=True) or {}
     name = data.get('name', 'Web Auto-Calib')
     success, msg = calibration_service.compute_and_save(name=name)
     return jsonify({'success': success, 'message': msg})

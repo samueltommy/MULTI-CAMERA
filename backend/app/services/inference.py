@@ -224,12 +224,8 @@ class InferenceManager:
         # the worker runs the requested `yolo26s-seg.pt` model by default.
         from pathlib import Path
         repo_root = Path(__file__).resolve().parents[3]
-        pt_candidate = repo_root / "models" / "yolo26-ayam.pt"
-        model_path_to_use = str(pt_candidate) if pt_candidate.exists() else self.config.MODEL_PATH
-        if pt_candidate.exists():
-            print(f"[inference] using PT model override: {model_path_to_use}")
-        else:
-            print(f"[inference] using configured model path: {model_path_to_use}")
+        model_path_to_use = self.config.MODEL_PATH
+        print(f"[inference] using configured model path: {model_path_to_use}")
 
         self.worker_proc = multiprocessing.Process(
             target=worker_process_func,

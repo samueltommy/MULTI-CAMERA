@@ -25,8 +25,8 @@ class CalibrationService:
         # Anda mengukur ini dari titik tengah ArUco ke titik tengah ArUco lainnya.
         # Jika Anda hanya memakai 4 (ID 1,2,3,4), sistem hanya akan membaca 4.
         self.real_world_map = {
-            1: [0, 0],         2: [200, 0],       # Kiri Atas, Kanan Atas
-            3: [200, 200],     4: [0, 200],       # Kanan Bawah, Kiri Bawah
+            1: [0, 0],         2: [100, 0],       # Kiri Atas, Kanan Atas
+            3: [100, 100],     4: [0, 100],       # Kanan Bawah, Kiri Bawah
             
             # Tambahan jika Anda iseng menaruh lebih banyak ArUco di tengah/pinggir:
             5: [100, 0],       6: [200, 100],

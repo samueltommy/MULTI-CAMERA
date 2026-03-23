@@ -5,7 +5,7 @@ from app.database.session import SessionLocal
 from app.database.models import Calibration
 
 class WeightPredictor:
-    def __init__(self, standard_width=1280, standard_height=720, camera_height_cm=200.0):
+    def __init__(self, standard_width=640, standard_height=360, camera_height_cm=170.0):
         self.standard_width = standard_width
         self.standard_height = standard_height
         
