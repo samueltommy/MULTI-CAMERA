@@ -66,30 +66,26 @@ class WeightPredictor:
         print(f"[Weight Predictor] OUTLIER Filter set to: {self.min_valid_kg:.3f} kg - {self.max_valid_kg:.3f} kg")
 
     def _get_real_world_area(self, top_det):
-        """Menghitung Luas Area asli (cm2) yang BEBAS dari Distorsi Perspektif Lensa"""
+        """Menghitung Luas Area asli (cm2) - VERSI BYPASS KALIBRASI"""
         x1, y1, x2, y2 = top_det['box']
         
         # Hitung luas kotak bounding box di piksel
         bbox_area_px = max(1.0, float((x2 - x1) * (y2 - y1)))
-        # Ambil luas tubuh ayam asli (mask) dari YOLO, jika tidak ada, pakai luas kotak
+        
+        # Ambil luas tubuh ayam asli (mask) dari YOLO
         mask_area_px = top_det.get('mask_area', bbox_area_px)
         
         # Cari rasio (berapa persen kotak tersebut terisi oleh tubuh ayam?)
         ratio = min(1.0, mask_area_px / bbox_area_px)
         
-        if self.H_scale_top is None:
-            return (bbox_area_px * (0.05 ** 2)) * ratio
-
-        pts_pixel = np.array([
-            [x1, y1], [x2, y1], [x2, y2], [x1, y2]
-        ], dtype=np.float32).reshape(-1, 1, 2)
+        # ========================================================
+        # KITA BYPASS MATRIKS YANG RUSAK, GUNAKAN RASIO MANUAL
+        # Asumsi kasar sementara: 1 pixel kamera = 0.12 cm di dunia nyata
+        # ========================================================
+        cm_per_pixel = 0.19 
         
-        # Proyeksi Piksel ke Dunia Nyata (cm2) untuk kotak
-        pts_cm = cv2.perspectiveTransform(pts_pixel, self.H_scale_top)
-        bbox_area_cm2 = cv2.contourArea(pts_cm)
-        
-        # LUAS ASLI AYAM = Luas kotak dunia nyata dikali persentase kepadatan tubuh
-        true_mask_area_cm2 = bbox_area_cm2 * ratio
+        # LUAS ASLI AYAM = Luas kotak (cm2) dikali persentase kepadatan tubuh
+        true_mask_area_cm2 = (bbox_area_px * (cm_per_pixel ** 2)) * ratio
         return true_mask_area_cm2
 
     def _compensate_z_axis(self, area_cm2, chicken_height_cm):
@@ -99,53 +95,60 @@ class WeightPredictor:
         return area_cm2 * (((H - chicken_height_cm) / H) ** 2)
 
     def predict_from_area(self, top_det, class_name, frame_shape):
-        """Algoritma 2D Area (Baseline)"""
+        """Algoritma 2D Area (Baseline) - TANPA FILTER"""
         try:
-            # Area dihitung dengan Homografi (Piksel miring jadi Lurus)
             base_area_cm2 = self._get_real_world_area(top_det)
-            if base_area_cm2 < 10.0: return 0.0
             
-            # Perhitungan 2D Murni
+            # MATIKAN FILTER LUAS MINIMAL
+            # if base_area_cm2 < 10.0: return 0.0
+            
             DENSITY_2D = 3.5
             base_weight_kg = ((base_area_cm2 ** 1.5) * DENSITY_2D) / 1000.0
             
             factor = self.weight_factors.get(class_name, 1.0)
             final_weight = base_weight_kg * factor
             
-            if final_weight < self.min_valid_kg or final_weight > self.max_valid_kg:
-                return 0.0 
+            # MATIKAN FILTER OUTLIER CIOMAS
+            # if final_weight < self.min_valid_kg or final_weight > self.max_valid_kg:
+            #     return 0.0 
                 
             return final_weight
         except Exception as e:
+            print(f"Error Area 2D: {e}")
             return 0.0
 
     def predict_from_volume(self, top_det, side_det, class_name, frame_shape):
-        """Algoritma 3D Volume (Fusi Top + Side)"""
+        """Algoritma 3D Volume (Fusi Top + Side) - TANPA FILTER"""
         try:
             base_area_cm2 = self._get_real_world_area(top_det)
             
             y1_s, y2_s = side_det['box'][1], side_det['box'][3]
             chicken_height_px = float(y2_s - y1_s)
-            chicken_height_cm = chicken_height_px * 0.1 # Nanti bisa disesuaikan
+            
+            # ========================================================
+            # PENYESUAIAN SKALA KAMERA SAMPING & MASSA JENIS (DENSITY)
+            # ========================================================
+            # 1. Rasio piksel tinggi kamera samping (Kita turunkan dari 0.1 menjadi 0.08)
+            cm_per_pixel_side = 0.08 
+            chicken_height_cm = chicken_height_px * cm_per_pixel_side 
             
             # Kompensasi Z-Axis (Metode 2.5D Canggih)
             true_surface_area_cm2 = self._compensate_z_axis(base_area_cm2, chicken_height_cm)
             
             volume_cm3 = true_surface_area_cm2 * chicken_height_cm
-            if volume_cm3 < 10.0: return 0.0
             
-            DENSITY_G_PER_CM3 = 2.7 
+            # 2. Massa Jenis (Density) Ayam yang Logis
+            # Kita turunkan dari 2.7 (aluminium) menjadi 1.2 (daging hewan unggas)
+            DENSITY_G_PER_CM3 = 1.2 
+            
             base_weight_kg = (volume_cm3 * DENSITY_G_PER_CM3) / 1000.0
             
             factor = self.weight_factors.get(class_name, 1.0)
             final_weight = base_weight_kg * factor
             
-            # Cek Outlier Ciomas
-            if final_weight < self.min_valid_kg or final_weight > self.max_valid_kg:
-                return 0.0 
-            
             return final_weight
         except Exception as e:
+            print(f"Error Volume 3D: {e}")
             return 0.0
 
 weight_predictor = WeightPredictor()

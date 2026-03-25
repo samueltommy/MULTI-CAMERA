@@ -146,7 +146,7 @@ class SnapshotService:
 
             # Ambil skala kalibrasi ArUco saat ini
             from app.services.weight_predictor import weight_predictor
-            obj.cm_per_pixel = weight_predictor.cm_per_pixel
+            obj.cm_per_pixel = getattr(weight_predictor, 'cm_per_pixel', 0.0)
             # -----------------------------------------------------
                 
             db.commit()

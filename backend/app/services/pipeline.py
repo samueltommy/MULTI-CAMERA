@@ -44,7 +44,10 @@ class PipelineService:
         self.latency_frame_counter = 0
 
     def _get_smart_weight(self, obj_id, current_center, raw_weight):
-        # (Logika smart weight sama seperti sebelumnya, tidak berubah)
+        # PROTEKSI 1: Jika raw_weight kosong (None) dari YOLO, paksa jadi 0.0
+        if raw_weight is None:
+            raw_weight = 0.0
+            
         if obj_id not in self.object_stats:
             self.object_stats[obj_id] = {
                 'centers': deque(maxlen=5),
@@ -53,9 +56,13 @@ class PipelineService:
         stats = self.object_stats[obj_id]
         if current_center:
             stats['centers'].append(current_center)
+            
         last_stable = stats['stable_weight']
-        if raw_weight < 0.05:
-            return last_stable
+        
+        # PROTEKSI 2: Pastikan perhitungannya adalah angka Float (Desimal)
+        if float(raw_weight) <= 0.0:
+            return float(last_stable)
+            
         is_moving = False
         if len(stats['centers']) >= 2:
             curr = stats['centers'][-1]
@@ -63,18 +70,22 @@ class PipelineService:
             dist = ((curr[0]-prev[0])**2 + (curr[1]-prev[1])**2)**0.5
             if dist > self.move_threshold:
                 is_moving = True
+                
         if is_moving and last_stable > 0:
-            return last_stable
+            return float(last_stable)
+            
         if last_stable > 0:
             diff_pct = abs(raw_weight - last_stable) / last_stable
             if diff_pct > self.jump_threshold:
-                return last_stable
+                return float(last_stable)
+                
         if last_stable == 0.0:
             new_weight = raw_weight
         else:
             new_weight = (self.alpha * raw_weight) + ((1 - self.alpha) * last_stable)
-        stats['stable_weight'] = new_weight
-        return new_weight
+            
+        stats['stable_weight'] = float(new_weight)
+        return float(new_weight)
 
     def start_session(self, duration=60):
         print(f"Starting triggered session for {duration} seconds")
@@ -359,7 +370,8 @@ class PipelineService:
                     raw_weight = weight_predictor.predict_from_volume(fo['top'], fo['side'], 'chicken', frame_shape)
                     final_weight = self._get_smart_weight(obj_id, top_center, raw_weight)
 
-                    if final_weight >= 0:
+                    # PROTEKSI 3: Pastikan final_weight bukan 'None' sebelum dibandingkan dengan angka
+                    if final_weight is not None and final_weight >= 0:
                         track_obj = {
                             'id': obj_id,
                             'top': fo['top'],
@@ -400,9 +412,10 @@ class PipelineService:
                             raw_weight = weight_predictor.predict_from_area(det_top, 'chicken', frame_shape)
                             final_weight = self._get_smart_weight(obj_id, top_center, raw_weight)
                             
-                            if final_weight >= 0:
+                            # PROTEKSI 4: Mencegah NoneType error di 2D Area
+                            if final_weight is not None and final_weight >= 0:
                                 track_obj = {
-                                    'id': self.unfused_id_counter, 
+                                    'id': obj_id, 
                                     'top': det_top,
                                     'side': None,
                                     'is_fused': False,
