@@ -74,6 +74,42 @@ class MLStatisticsService:
             
             print(f"[ML Stats] Session {session_id} DONE! Avg: {final_average:.3f} kg")
 
+            # ======================================================
+            # 7. TRIGGER OTOMATIS KE SUPABASE SETELAH STATISTIK SELESAI
+            # ======================================================
+            try:
+                from app.services.cloud_telemetry import cloud_telemetry
+                import threading
+                from datetime import date
+
+                # Cari umur ayam untuk dashboard Cloud
+                farm_setting = db.query(FarmSettings).first()
+                age_days = 0
+                if farm_setting and farm_setting.chick_in_date:
+                    age_days = max(0, (date.today() - farm_setting.chick_in_date).days)
+
+                # Siapkan data detail ayam
+                detailed_records = []
+                for r in records:
+                    detailed_records.append({
+                        'track_id': r.track_id,
+                        'estimated_weight': r.estimated_weight,
+                        'is_fused': r.is_fused
+                    })
+
+                # Lempar ke background thread agar tidak membuat sistem lokal Lag
+                def push_and_sync():
+                    # 1. Kirim data sesi yang baru saja selesai
+                    cloud_telemetry.push_full_backup(session_id, age_days, final_average, valid_count, detailed_records)
+                    # 2. Cek apakah ada data masa lalu yang belum terkirim
+                    cloud_telemetry.run_sync_missing_data()
+
+                # Lempar ke background thread agar Edge Node tidak Lag
+                threading.Thread(target=push_and_sync, daemon=True).start()
+            except Exception as cloud_err:
+                print(f"[ML Stats] Gagal trigger Supabase: {cloud_err}")
+            # ======================================================
+
         except Exception as e:
             print(f"[ML Stats] Error: {e}")
             db.rollback()

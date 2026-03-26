@@ -8,7 +8,7 @@ def trigger_cloud_sync():
 
     # 1. Definisi Path
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    video_dir = os.path.join(base_dir, 'videos')
+    video_dir = os.path.abspath(os.path.join(base_dir, '..', 'videos')) 
     backup_dir = os.path.join(base_dir, 'backups')
     env_path = os.path.join(base_dir, '.env')
 

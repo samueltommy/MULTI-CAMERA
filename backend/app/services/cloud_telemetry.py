@@ -4,6 +4,9 @@ import csv
 import os
 import sys
 import json
+from datetime import datetime, date
+from app.database.session import SessionLocal
+from app.database.models import SessionStat, FusedObject, FarmSettings
 
 class CloudTelemetryService:
     def __init__(self):
@@ -51,7 +54,6 @@ class CloudTelemetryService:
                         "track_id": record['track_id'],
                         "weight_kg": record['estimated_weight'],
                         "is_fused": record['is_fused'],
-                        "timestamp": record['created_at']
                     })
                 # Menghitung ukuran JSON Detail (Semua data ayam) dalam satuan Byte
                 details_bytes = len(json.dumps(bulk_payload).encode('utf-8'))
@@ -105,5 +107,68 @@ class CloudTelemetryService:
             
             # Tulis data
             writer.writerow([session_id, record_count, round(latency_ms, 2), payload_bytes])
+
+    def run_sync_missing_data(self):
+        """Mekanisme Store-and-Forward: Cek Supabase, Upload yang tertinggal"""
+        print("\n[Cloud-Sync] 🔄 Mengecek data yang tertinggal di Edge (Store-and-Forward)...")
+        try:
+            # 1. Tanya Supabase: "Kamu sudah punya session_id apa saja?"
+            resp = requests.get(
+                f"{self.supabase_url_summary}?select=session_id", 
+                headers=self.headers,
+                timeout=10
+            )
+            if resp.status_code != 200:
+                print(f"[Cloud-Sync] Gagal membaca Supabase.")
+                return
+            
+            # Kumpulan session_id yang sudah aman di awan
+            cloud_sessions = {item['session_id'] for item in resp.json()}
+            
+            # 2. Cek Database Lokal PostgreSQL
+            db = SessionLocal()
+            local_sessions = db.query(SessionStat).all()
+            
+            # Cari selisihnya (Data lokal yang belum ada di awan)
+            missing_sessions = [s for s in local_sessions if s.session_id not in cloud_sessions]
+            
+            if not missing_sessions:
+                print("[Cloud-Sync] ✅ Semua data lokal sudah sinkron dengan Cloud!")
+                db.close()
+                return
+                
+            print(f"[Cloud-Sync] ⚠️ Ditemukan {len(missing_sessions)} sesi yang belum ter-upload. Mengirim sekarang...")
+            
+            # 3. Upload yang tertinggal satu per satu
+            farm_setting = db.query(FarmSettings).first()
+            for stat in missing_sessions:
+                # Hitung umur
+                age_days = 0
+                if farm_setting and farm_setting.chick_in_date:
+                    age_days = max(0, (date.today() - farm_setting.chick_in_date).days)
+                    
+                # Tarik detail ayam dari sesi tersebut
+                records = db.query(FusedObject).filter(FusedObject.session_id == stat.session_id).all()
+                detailed_records = [{
+                    'track_id': r.track_id,
+                    'estimated_weight': r.estimated_weight,
+                    'is_fused': r.is_fused
+                } for r in records]
+                
+                # Push ke awan
+                self.push_full_backup(
+                    stat.session_id, 
+                    age_days, 
+                    stat.ai_average_weight_kg, 
+                    stat.valid_chickens_used, 
+                    detailed_records
+                )
+                time.sleep(1) # Beri jeda 1 detik agar Supabase tidak menolak karena spam (Rate Limit)
+                
+            db.close()
+            print("[Cloud-Sync] 🎉 Proses sinkronisasi susulan SELESAI!")
+            
+        except Exception as e:
+            print(f"[Cloud-Sync] ❌ Error saat sinkronisasi: {e}")
 
 cloud_telemetry = CloudTelemetryService()
