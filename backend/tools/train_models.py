@@ -13,7 +13,7 @@ from sklearn.preprocessing import PolynomialFeatures
 from sklearn.pipeline import make_pipeline
 
 # 1. LOAD DATASET
-DATA_PATH = "../data/ready_for_training.csv"
+DATA_PATH = "../data/ready_for_training_combined.csv"
 print(f"📦 Memuat dataset dari: {DATA_PATH}...")
 df = pd.read_csv(DATA_PATH)
 

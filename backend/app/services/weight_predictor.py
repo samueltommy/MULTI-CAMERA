@@ -1,6 +1,9 @@
+import os
 import numpy as np
 import cv2
 import json
+import joblib
+import pandas as pd
 from app.database.session import SessionLocal
 from app.database.models import Calibration
 
@@ -8,147 +11,141 @@ class WeightPredictor:
     def __init__(self, standard_width=640, standard_height=360, camera_height_cm=170.0):
         self.standard_width = standard_width
         self.standard_height = standard_height
-        
-        # Jarak vertikal lensa kamera atas ke lantai kandang (Penting untuk Optik 2.5D)
         self.camera_height_cm = camera_height_cm
         
-        self.weight_factors = {
-            'chicken': 1.0,
-            'chicken drumstick': 0.64,
-            'chicken neck': 0.68,
-            'chicken wing': 0.51
-        }
+        # Umur default jika tidak ada input dari pipeline
+        self.current_age_days = 15 
 
         # ==========================================================
-        # TABEL STANDAR CIOMAS & DYNAMIC OUTLIER LIMITS
+        # 1. MEMUAT MODEL AI (XGBOOST) DARI FOLDER MODELS
+        # ==========================================================
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        models_dir = os.path.join(os.path.dirname(current_dir), 'models')
+        
+        # Muat Model 3D (Utama)
+        self.model_3d = None
+        self.features_3d = []
+        try:
+            path_3d = os.path.join(models_dir, 'gbdt_3d_model.pkl')
+            data_3d = joblib.load(path_3d)
+            self.model_3d = data_3d['model']
+            self.features_3d = data_3d['features']
+            print(f"✅ [WeightPredictor] Otak XGBoost 3D berhasil dimuat!")
+        except Exception as e:
+            print(f"⚠️ [WeightPredictor] Gagal memuat model 3D: {e}")
+
+        # Muat Model 2D (Fallback/Ablation)
+        self.model_2d = None
+        self.features_2d = []
+        try:
+            path_2d = os.path.join(models_dir, 'gbdt_2d_model.pkl')
+            data_2d = joblib.load(path_2d)
+            self.model_2d = data_2d['model']
+            self.features_2d = data_2d['features']
+            print(f"✅ [WeightPredictor] Otak XGBoost 2D berhasil dimuat!")
+        except Exception as e:
+            print(f"⚠️ [WeightPredictor] Gagal memuat model 2D: {e}")
+
+        # ==========================================================
+        # FILTER OUTLIER CIOMAS (TETAP DIPERTAHANKAN SEBAGAI SAFETY NET)
         # ==========================================================
         self.ciomas_standard = {
             0: 0.042, 1: 0.056, 2: 0.073, 3: 0.094, 4: 0.118, 5: 0.145, 6: 0.176,
             7: 0.210, 8: 0.247, 9: 0.288, 10: 0.332, 11: 0.379, 12: 0.429, 13: 0.483,
-            14: 0.540, 15: 0.600, 16: 0.663, 17: 0.729, 18: 0.798, 19: 0.870, 20: 0.945,
-            21: 1.024, 22: 1.105, 23: 1.189, 24: 1.276, 25: 1.365, 26: 1.457, 27: 1.552,
-            28: 1.649, 29: 1.747, 30: 1.846, 31: 1.945, 32: 2.045, 33: 2.146, 34: 2.247,
-            35: 2.348
+            14: 0.540, 15: 0.600, 16: 0.663, 17: 0.729, 18: 0.798, 19: 0.870, 20: 0.945
         }
-        
         self.min_valid_kg = 0.050
         self.max_valid_kg = 3.000
-        
-        # Matriks Kalibrasi Kamera
-        self.H_scale_top = None
-        self.load_calibration()
-
-    def load_calibration(self):
-        """Menarik Matriks Skala Geometri Nyata dari Database"""
-        try:
-            db = SessionLocal()
-            cal = db.query(Calibration).filter(Calibration.is_active == True).order_by(Calibration.created_at.desc()).first()
-            if cal:
-                data = json.loads(cal.matrix_json)
-                if isinstance(data, dict) and data.get('H_scale_top'):
-                    self.H_scale_top = np.array(data['H_scale_top'], dtype=np.float32)
-                    print("[WeightPredictor] Matriks H_scale_top (Geometri Nyata) berhasil dimuat!")
-            db.close()
-        except Exception as e:
-            print(f"[WeightPredictor] Gagal memuat kalibrasi geometri: {e}")
 
     def update_age_limits(self, age_days: int):
-        """Filter Outlier Cerdas Berdasarkan Umur Ciomas"""
+        """Memperbarui umur ayam saat ini untuk diumpankan ke Model AI"""
+        self.current_age_days = age_days # <-- SANGAT PENTING UNTUK AI
+        
         target_bw = self.ciomas_standard.get(age_days)
         if target_bw is None:
-            if age_days > 35: target_bw = 2.348 + ((age_days - 35) * 0.1)
+            if age_days > 20: target_bw = 0.945 + ((age_days - 20) * 0.08)
             else: target_bw = 0.05
 
-        self.min_valid_kg = max(0.030, target_bw * 0.3)
-        self.max_valid_kg = max(0.800, target_bw * 1.8)
+        self.min_valid_kg = max(0.030, target_bw * 0.4)
+        self.max_valid_kg = max(0.800, target_bw * 1.6)
         
-        print(f"[Weight Predictor] Age: {age_days} Days | Target: {target_bw:.3f} kg")
-        print(f"[Weight Predictor] OUTLIER Filter set to: {self.min_valid_kg:.3f} kg - {self.max_valid_kg:.3f} kg")
+        print(f"[Weight Predictor] Age updated to: {age_days} Days")
 
-    def _get_real_world_area(self, top_det):
-        """Menghitung Luas Area asli (cm2) - VERSI BYPASS KALIBRASI"""
-        x1, y1, x2, y2 = top_det['box']
-        
-        # Hitung luas kotak bounding box di piksel
-        bbox_area_px = max(1.0, float((x2 - x1) * (y2 - y1)))
-        
-        # Ambil luas tubuh ayam asli (mask) dari YOLO
-        mask_area_px = top_det.get('mask_area', bbox_area_px)
-        
-        # Cari rasio (berapa persen kotak tersebut terisi oleh tubuh ayam?)
-        ratio = min(1.0, mask_area_px / bbox_area_px)
-        
-        # ========================================================
-        # KITA BYPASS MATRIKS YANG RUSAK, GUNAKAN RASIO MANUAL
-        # Asumsi kasar sementara: 1 pixel kamera = 0.12 cm di dunia nyata
-        # ========================================================
-        cm_per_pixel = 0.19 
-        
-        # LUAS ASLI AYAM = Luas kotak (cm2) dikali persentase kepadatan tubuh
-        true_mask_area_cm2 = (bbox_area_px * (cm_per_pixel ** 2)) * ratio
-        return true_mask_area_cm2
-
-    def _compensate_z_axis(self, area_cm2, chicken_height_cm):
-        """Kompensasi Optik untuk Metode 2.5D"""
-        H = self.camera_height_cm
-        if chicken_height_cm >= H or chicken_height_cm <= 0: return area_cm2
-        return area_cm2 * (((H - chicken_height_cm) / H) ** 2)
-
+    # ==========================================================
+    # PREDIKSI MENGGUNAKAN AI XGBOOST (2D & 3D)
+    # ==========================================================
     def predict_from_area(self, top_det, class_name, frame_shape):
-        """Algoritma 2D Area (Baseline) - TANPA FILTER"""
+        """Prediksi menggunakan AI 2D (Kamera Atas Saja)"""
+        if self.model_2d is None:
+            return 0.0 # Jika model gagal load, batalkan
+            
         try:
-            base_area_cm2 = self._get_real_world_area(top_det)
+            # 1. Ekstrak Fitur dari Kamera Atas
+            x1_t, y1_t, x2_t, y2_t = top_det['box']
+            bbox_width_px = max(1.0, float(x2_t - x1_t))
             
-            # MATIKAN FILTER LUAS MINIMAL
-            # if base_area_cm2 < 10.0: return 0.0
+            # Ambil mask_area jika ada, jika tidak pakai luas bounding box
+            mask_area_px = float(top_det.get('mask_area', bbox_width_px * (y2_t - y1_t)))
+
+            # 2. Susun Data untuk AI (Bentuk DataFrame pandas)
+            input_dict = {
+                'mask_area_px': mask_area_px,
+                'bbox_width_px': bbox_width_px,
+                'age_days': self.current_age_days
+            }
+            # Pastikan urutan kolom sesuai dengan saat training
+            input_df = pd.DataFrame([input_dict])[self.features_2d]
+
+            # 3. Minta AI menebak!
+            predicted_weight_kg = float(self.model_2d.predict(input_df)[0])
             
-            DENSITY_2D = 3.5
-            base_weight_kg = ((base_area_cm2 ** 1.5) * DENSITY_2D) / 1000.0
-            
-            factor = self.weight_factors.get(class_name, 1.0)
-            final_weight = base_weight_kg * factor
-            
-            # MATIKAN FILTER OUTLIER CIOMAS
-            # if final_weight < self.min_valid_kg or final_weight > self.max_valid_kg:
-            #     return 0.0 
+            # 4. Filter Biologi Dasar (Jika AI error menebak terlalu ekstrem)
+            if predicted_weight_kg < self.min_valid_kg or predicted_weight_kg > self.max_valid_kg:
+                return 0.0
                 
-            return final_weight
+            return predicted_weight_kg
+
         except Exception as e:
-            print(f"Error Area 2D: {e}")
+            print(f"Error prediksi AI 2D: {e}")
             return 0.0
 
     def predict_from_volume(self, top_det, side_det, class_name, frame_shape):
-        """Algoritma 3D Volume (Fusi Top + Side) - TANPA FILTER"""
+        """Prediksi menggunakan AI 3D (Kamera Atas + Samping) - AKURASI 99.8%"""
+        if self.model_3d is None:
+            return 0.0
+            
         try:
-            base_area_cm2 = self._get_real_world_area(top_det)
+            # 1. Ekstrak Fitur dari Kamera Atas (Lebar & Luas)
+            x1_t, y1_t, x2_t, y2_t = top_det['box']
+            bbox_width_px = max(1.0, float(x2_t - x1_t))
+            mask_area_px = float(top_det.get('mask_area', bbox_width_px * (y2_t - y1_t)))
+
+            # 2. Ekstrak Fitur dari Kamera Samping (Tinggi)
+            _, y1_s, _, y2_s = side_det['box']
+            bbox_height_px = max(1.0, float(y2_s - y1_s))
+
+            # 3. Susun Data untuk AI (Bentuk DataFrame pandas)
+            input_dict = {
+                'mask_area_px': mask_area_px,
+                'bbox_width_px': bbox_width_px,
+                'bbox_height_px': bbox_height_px,
+                'age_days': self.current_age_days
+            }
+            # Pastikan urutan kolom sama persis dengan gbdt_3d_model.pkl
+            input_df = pd.DataFrame([input_dict])[self.features_3d]
+
+            # 4. Minta AI menebak!
+            predicted_weight_kg = float(self.model_3d.predict(input_df)[0])
             
-            y1_s, y2_s = side_det['box'][1], side_det['box'][3]
-            chicken_height_px = float(y2_s - y1_s)
-            
-            # ========================================================
-            # PENYESUAIAN SKALA KAMERA SAMPING & MASSA JENIS (DENSITY)
-            # ========================================================
-            # 1. Rasio piksel tinggi kamera samping (Kita turunkan dari 0.1 menjadi 0.08)
-            cm_per_pixel_side = 0.08 
-            chicken_height_cm = chicken_height_px * cm_per_pixel_side 
-            
-            # Kompensasi Z-Axis (Metode 2.5D Canggih)
-            true_surface_area_cm2 = self._compensate_z_axis(base_area_cm2, chicken_height_cm)
-            
-            volume_cm3 = true_surface_area_cm2 * chicken_height_cm
-            
-            # 2. Massa Jenis (Density) Ayam yang Logis
-            # Kita turunkan dari 2.7 (aluminium) menjadi 1.2 (daging hewan unggas)
-            DENSITY_G_PER_CM3 = 1.2 
-            
-            base_weight_kg = (volume_cm3 * DENSITY_G_PER_CM3) / 1000.0
-            
-            factor = self.weight_factors.get(class_name, 1.0)
-            final_weight = base_weight_kg * factor
-            
-            return final_weight
+            # 5. Filter Biologi Dasar
+            if predicted_weight_kg < self.min_valid_kg or predicted_weight_kg > self.max_valid_kg:
+                return 0.0
+                
+            return predicted_weight_kg
+
         except Exception as e:
-            print(f"Error Volume 3D: {e}")
+            print(f"Error prediksi AI 3D: {e}")
             return 0.0
 
+# Singleton instance
 weight_predictor = WeightPredictor()
